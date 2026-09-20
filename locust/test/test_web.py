@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import locust
-from locust import LoadTestShape, constant, stats
+from locust import LoadTestShape, __version__, constant, stats
 from locust.argument_parser import get_parser
 from locust.env import Environment
 from locust.log import LogReader
-from locust.runners import Runner
+from locust.rpc import Message
+from locust.runners import STATE_RUNNING, Runner
 from locust.stats import StatsCSVFileWriter
+from locust.test.test_runners import mocked_rpc
 from locust.user import User, task
 from locust.web import WebUI
 
@@ -14,6 +16,7 @@ import csv
 import json
 import logging
 import os
+import time
 import traceback
 from io import StringIO
 from tempfile import NamedTemporaryFile
@@ -316,6 +319,16 @@ class TestWebUI(LocustTestCase, _HeaderCheckMixin):
         self.assertEqual(200, response.status_code)
         self.assertFalse(response.json()["success"])
         self.assertIn("spawn_rate", response.json()["message"])
+
+    def test_drain_endpoints_require_master_runner(self):
+        for endpoint in ("/drain", "/undrain"):
+            response = requests.post(
+                "http://127.0.0.1:%i%s" % (self.web_port, endpoint),
+                data={"worker_id": "some_worker"},
+            )
+            self.assertEqual(400, response.status_code)
+            self.assertFalse(response.json()["success"])
+            self.assertIn("master", response.json()["message"])
 
     def test_swarm_userclass_specified(self):
         class User1(User):
@@ -1211,6 +1224,152 @@ class TestWebUI(LocustTestCase, _HeaderCheckMixin):
             response = self.web_ui.app.test_client().get("/")
             self.assertEqual(response.status_code, 500)
             self.assertEqual(response.get_data(as_text=True), expected_message)
+
+
+class WebDrainTestUser(User):
+    wait_time = constant(0.05)
+
+    @task
+    def sleep_forever(self):
+        gevent.sleep(30)
+
+
+class TestWebUIDrain(LocustTestCase):
+    WORKER_IDS = ("fake_client1", "fake_client2", "fake_client3")
+
+    def setUp(self):
+        super().setUp()
+        self.local_runner = self.runner
+
+        self.rpc_patcher = patch("locust.rpc.rpc.Server", mocked_rpc())
+        self.server = self.rpc_patcher.start()
+        self.addCleanup(self.rpc_patcher.stop)
+        self._prev_report_wait = os.environ.get("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP")
+        os.environ["LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP"] = "0"
+        self.addCleanup(self._restore_report_wait_env)
+
+        self.environment = Environment(
+            events=locust.events, catch_exceptions=False, user_classes=[WebDrainTestUser]
+        )
+        self.environment.parsed_options = get_parser(default_config_files=[]).parse_args([])
+        self.master = self.environment.create_master_runner("*", 5557)
+        for worker_id in self.WORKER_IDS:
+            self.server.mocked_send(Message("client_ready", __version__, worker_id))
+        gevent.sleep(0.05)
+        self.master.start(12, 1000)
+        targets = self.master._users_dispatcher.current_targets()
+        for worker_id in self.WORKER_IDS:
+            node = self.master.clients[worker_id]
+            node.state = STATE_RUNNING
+            node.user_classes_count = dict(targets[worker_id])
+
+        self.web_ui = self.environment.create_web_ui("127.0.0.1", 0)
+        self.web_ui.app.view_functions["locust.request_stats"].clear_cache()
+        gevent.sleep(0.01)
+        self.web_port = self.web_ui.server.server_port
+
+    def _restore_report_wait_env(self):
+        if self._prev_report_wait is None:
+            os.environ.pop("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", None)
+        else:
+            os.environ["LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP"] = self._prev_report_wait
+
+    def tearDown(self):
+        try:
+            self._wait_drain_idle()
+            self.web_ui.stop()
+            self.master.quit()
+            self.local_runner.quit()
+        finally:
+            super().tearDown()
+
+    def _url(self, path):
+        return "http://127.0.0.1:%i%s" % (self.web_port, path)
+
+    def _wait_drain_idle(self, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline and (self.master._drain_queue or self.master._draining_client_id):
+            gevent.sleep(0.01)
+
+    def _workers_stats(self):
+        # request_stats is memoized; clear it to read the post-drain state immediately
+        self.web_ui.app.view_functions["locust.request_stats"].clear_cache()
+        report = requests.get(self._url("/stats/requests")).json()
+        return {worker["id"]: worker for worker in report["workers"]}, report["worker_count"]
+
+    def test_drain_missing_worker_id_returns_400(self):
+        response = requests.post(self._url("/drain"))
+        self.assertEqual(400, response.status_code)
+        self.assertIn("worker_id", response.json()["message"])
+
+    def test_drain_invalid_spawn_rate_returns_400(self):
+        response = requests.post(
+            self._url("/drain"), data={"worker_id": self.WORKER_IDS[0], "spawn_rate": "fast"}
+        )
+        self.assertEqual(400, response.status_code)
+        self.assertIn("spawn_rate", response.json()["message"])
+
+    def test_drain_unknown_worker_returns_404(self):
+        response = requests.post(self._url("/drain"), data={"worker_id": "does_not_exist"})
+        self.assertEqual(404, response.status_code)
+        self.assertFalse(response.json()["success"])
+
+    def test_undrain_unknown_worker_returns_404(self):
+        response = requests.post(self._url("/undrain"), data={"worker_id": "does_not_exist"})
+        self.assertEqual(404, response.status_code)
+        self.assertFalse(response.json()["success"])
+
+    def test_drain_reports_in_stats_and_is_idempotent(self):
+        drained_id = self.WORKER_IDS[0]
+        response = requests.post(self._url("/drain"), data={"worker_id": drained_id, "spawn_rate": 1000})
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.json()["success"])
+        self._wait_drain_idle()
+
+        workers, worker_count = self._workers_stats()
+        self.assertTrue(workers[drained_id]["drained"])
+        self.assertTrue(all(not workers[worker_id]["drained"] for worker_id in self.WORKER_IDS[1:]))
+        self.assertEqual(2, worker_count)
+        # the drained worker stays connected and carries no users
+        self.assertIn(drained_id, self.master.clients)
+        self.assertEqual(0, self.master._users_dispatcher.current_targets()[drained_id]["WebDrainTestUser"])
+
+        # repeating the request is a successful no-op, not an error
+        response = requests.post(self._url("/drain"), data={"worker_id": drained_id})
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.json()["success"])
+
+        # undraining clears the flag and makes the worker count again
+        response = requests.post(self._url("/undrain"), data={"worker_id": drained_id})
+        self.assertEqual(200, response.status_code)
+        _, worker_count = self._workers_stats()
+        self.assertEqual(3, worker_count)
+        self.assertFalse(self.master.clients[drained_id].drained)
+
+        # undraining a worker that was never drained is a no-op success
+        response = requests.post(self._url("/undrain"), data={"worker_id": self.WORKER_IDS[1]})
+        self.assertEqual(200, response.status_code)
+
+    def test_undrain_while_drain_in_progress_conflicts(self):
+        drained_id = self.WORKER_IDS[0]
+        # scale up so the worker carries enough users for a slow drain to stay in flight
+        self.master.start(24, 1000)
+        self.assertGreaterEqual(
+            self.master._users_dispatcher.current_targets()[drained_id]["WebDrainTestUser"], 4
+        )
+        response = requests.post(self._url("/drain"), data={"worker_id": drained_id, "spawn_rate": 1})
+        self.assertEqual(200, response.status_code)
+
+        deadline = time.time() + 3
+        conflict_response = None
+        while time.time() < deadline:
+            conflict_response = requests.post(self._url("/undrain"), data={"worker_id": drained_id})
+            if conflict_response.status_code == 409:
+                break
+            gevent.sleep(0.02)
+        self.assertIsNotNone(conflict_response)
+        self.assertEqual(409, conflict_response.status_code)
+        self.assertFalse(conflict_response.json()["success"])
 
 
 class TestWebUIAuth(LocustTestCase):

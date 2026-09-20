@@ -6,6 +6,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -13,7 +14,7 @@ import sys
 import time
 import traceback
 from abc import abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterator, MutableMapping, ValuesView
 from operator import itemgetter, methodcaller
 from types import TracebackType
@@ -587,6 +588,13 @@ class DistributedRunner(Runner):
         setup_distributed_stats_event_listeners(self.environment.events, self.stats)
 
 
+class WorkerDrainInProgress(RuntimeError):
+    """
+    Raised when trying to undo (``undrain``) a worker whose drain operation is
+    currently being performed. Mapped to HTTP 409 by the web UI.
+    """
+
+
 class WorkerNode:
     def __init__(self, id: str, state=STATE_INIT, heartbeat_liveness=HEARTBEAT_LIVENESS) -> None:
         self.id: str = id
@@ -597,6 +605,9 @@ class WorkerNode:
         self.memory_usage: int = 0
         # The reported users running on the worker
         self.user_classes_count: dict[str, int] = {}
+        # Set when the worker has been drained (taken out of load) by the master.
+        # A drained worker stays connected but runs no users and is excluded from dispatch.
+        self.drained: bool = False
 
     @property
     def user_count(self) -> int:
@@ -688,6 +699,15 @@ class MasterRunner(DistributedRunner):
 
         self._users_dispatcher: UsersDispatcher | None = None
 
+        # Worker draining (taking specific workers out of load for maintenance)
+        # client_ids of workers that are draining or fully drained
+        self.drained_client_ids: set[str] = set()
+        # client_ids waiting to be drained, processed one at a time with their spawn rate
+        self._drain_queue: deque[tuple[str, float]] = deque()
+        # client_id of the worker currently being drained
+        self._draining_client_id: str | None = None
+        self._drain_greenlet: gevent.Greenlet | None = None
+
         self.greenlet.spawn(self.heartbeat_worker).link_exception(locust_exception_handler(self.environment))
         self.greenlet.spawn(self.client_listener).link_exception(locust_exception_handler(self.environment))
 
@@ -742,11 +762,21 @@ class MasterRunner(DistributedRunner):
 
         self.target_user_count = user_count
 
-        active_workers = self.clients.ready + self.clients.running + self.clients.spawning
+        active_workers = [
+            worker
+            for worker in self.clients.ready + self.clients.running + self.clients.spawning
+            if worker.id not in self.drained_client_ids
+        ]
         num_workers = len(active_workers)
         if not num_workers:
             logger.warning("You can't start a distributed test before at least one worker processes has connected")
             return
+
+        # A new dispatch supersedes any in-flight/queued drain operation. The drain
+        # markers of already-drained workers are kept (they must not get users), but
+        # we stop sending drain ramp messages so both paths don't dispatch at once.
+        if self._drain_greenlet is not None or self._drain_queue:
+            self._abort_drain_dispatch()
 
         for user_class in self.user_classes:
             if self.environment.host:
@@ -788,20 +818,11 @@ class MasterRunner(DistributedRunner):
             for dispatched_users in self._users_dispatcher:
                 dispatch_greenlets = Group()
                 for worker_node_id, worker_user_classes_count in dispatched_users.items():
-                    data = {
-                        "timestamp": time.time(),
-                        "user_classes_count": worker_user_classes_count,
-                        "host": self.environment.host,
-                        "stop_timeout": self.environment.stop_timeout,
-                        "parsed_options": vars(self.environment.parsed_options)
-                        if self.environment.parsed_options
-                        else {},
-                    }
                     dispatch_greenlets.add(
                         gevent.spawn_later(
                             0,
                             self.server.send_to_client,
-                            Message("spawn", data, worker_node_id),
+                            self._build_spawn_message(worker_node_id, worker_user_classes_count),
                         )
                     )
                 dispatched_user_count = sum(map(sum, map(methodcaller("values"), dispatched_users.values())))
@@ -872,6 +893,304 @@ class MasterRunner(DistributedRunner):
         else:
             return float(match.group("coeff")) * WORKER_REPORT_INTERVAL
 
+    # ------------------------------------------------------------------
+    # Worker draining (taking a specific online worker out of load so it
+    # can be maintained, while replenishing its users on the other workers)
+    # ------------------------------------------------------------------
+
+    def _online_workers(self) -> list[WorkerNode]:
+        return self.clients.ready + self.clients.running + self.clients.spawning
+
+    def _queued_drain_ids(self) -> set[str]:
+        return {queued_id for queued_id, _ in self._drain_queue}
+
+    def drain_worker(self, worker_id: str, spawn_rate: float | None = None) -> None:
+        """
+        Take an online worker gracefully out of load ("drain" it).
+
+        The worker keeps its connection to the master but all its users are stopped
+        (honoring ``stop_timeout``), while the users it was running, per user class,
+        are replenished as increments on the other online workers at the given
+        ``spawn_rate``. Existing users on the other workers are never stopped.
+
+        Drain requests are queued and processed one worker at a time. Draining an
+        already drained/queued/draining worker is a no-op.
+
+        :param worker_id: The client id of the worker to drain.
+        :param spawn_rate: Users per second at which to replenish. Defaults to the
+                          current test's spawn rate.
+        """
+        if worker_id not in self.clients:
+            raise LookupError(f"Cannot drain unknown worker {worker_id!r}")
+        if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
+            raise ValueError("Workers can only be drained while a test is running or spawning")
+        if spawn_rate is not None and spawn_rate <= 0:
+            raise ValueError("spawn_rate must be greater than 0")
+        if (
+            worker_id in self.drained_client_ids
+            or worker_id in self._queued_drain_ids()
+            or worker_id == self._draining_client_id
+        ):
+            logger.info("Worker %s is already drained, draining or queued for draining. Ignoring request", worker_id)
+            return
+
+        rate = float(spawn_rate) if spawn_rate is not None else float(self.spawn_rate)
+        if rate <= 0:
+            raise ValueError("A positive spawn rate is required to drain a worker")
+
+        excluded = self.drained_client_ids | self._queued_drain_ids() | {worker_id}
+        if not [worker for worker in self._online_workers() if worker.id not in excluded]:
+            raise ValueError(
+                f"Cannot drain worker {worker_id!r}: at least one other online worker is required to take its users"
+            )
+
+        self._drain_queue.append((worker_id, rate))
+        logger.info(
+            "Queued worker %s (index %d) for draining; users will be replenished at a rate of %.2f/s",
+            worker_id,
+            self.get_worker_index(worker_id),
+            rate,
+        )
+        self._ensure_drain_greenlet()
+
+    def undrain_worker(self, worker_id: str) -> None:
+        """
+        Reverse of :meth:`drain_worker`: re-admit a drained worker into the pool of
+        schedulable workers. No users are moved or stopped (the worker will pick up
+        users on subsequent ramp-ups/rebalances). A drain request still waiting in
+        the queue is cancelled.
+        """
+        if worker_id not in self.clients:
+            raise LookupError(f"Cannot undrain unknown worker {worker_id!r}")
+
+        queued_index = next(
+            (i for i, (queued_id, _) in enumerate(self._drain_queue) if queued_id == worker_id), None
+        )
+        if queued_index is not None:
+            del self._drain_queue[queued_index]
+            logger.info("Cancelled queued drain request for worker %s", worker_id)
+            return
+
+        if worker_id == self._draining_client_id:
+            raise WorkerDrainInProgress(
+                f"Worker {worker_id!r} is currently being drained; wait for it to finish before undoing it"
+            )
+
+        if worker_id not in self.drained_client_ids:
+            logger.info("Worker %s is not drained, ignoring undrain request", worker_id)
+            return
+
+        if self._users_dispatcher is not None:
+            self._users_dispatcher.readd_worker(self.clients[worker_id])
+        self.drained_client_ids.discard(worker_id)
+        self.clients[worker_id].drained = False
+        logger.info("Worker %s (index %d) is back in the pool of schedulable workers", worker_id, self.get_worker_index(worker_id))
+
+    def _ensure_drain_greenlet(self) -> None:
+        if self._drain_greenlet is None or self._drain_greenlet.ready():
+            self._drain_greenlet = self.greenlet.spawn(self._drain_workers)
+            self._drain_greenlet.link_exception(locust_exception_handler(self.environment))
+
+    def _abort_drain_dispatch(self) -> None:
+        """Stop dispatching drain ramps. Already-applied drain markers are deliberately kept."""
+        self._draining_client_id = None
+        self._drain_queue.clear()
+        if self._drain_greenlet is not None and not self._drain_greenlet.ready():
+            self._drain_greenlet.kill(block=False)
+        self._drain_greenlet = None
+
+    def _reset_worker_draining(self) -> None:
+        """Tear down all drain bookkeeping (called when the test stops)."""
+        self._abort_drain_dispatch()
+        self.drained_client_ids.clear()
+        for client in self.clients.all:
+            client.drained = False
+
+    def _discard_worker_drain_state(self, worker_id: str) -> None:
+        """Drop all drain bookkeeping for a worker that has left (stop/quit/dead removal)."""
+        self.drained_client_ids.discard(worker_id)
+        self._drain_queue = deque(item for item in self._drain_queue if item[0] != worker_id)
+
+    def _drain_workers(self) -> None:
+        """Serial drain queue processor: workers are drained one at a time."""
+        try:
+            while self._drain_queue:
+                if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
+                    logger.info("Test is not running anymore, cancelling %d queued worker drain(s)", len(self._drain_queue))
+                    self._drain_queue.clear()
+                    return
+                worker_id, rate = self._drain_queue.popleft()
+                try:
+                    self._drain_worker(worker_id, rate)
+                except Exception:
+                    logger.error(
+                        f"Uncaught exception while draining worker {worker_id}\n{traceback.format_exc()}"
+                    )
+        finally:
+            self._draining_client_id = None
+            self._drain_greenlet = None
+
+    def _drain_worker(self, worker_id: str, spawn_rate: float) -> None:
+        self._draining_client_id = worker_id
+        try:
+            client = self.clients.get(worker_id)
+            dispatcher = self._users_dispatcher
+            if client is None:
+                logger.info("Worker %s disconnected before it could be drained", worker_id)
+                return
+            if dispatcher is None or self.state not in (STATE_RUNNING, STATE_SPAWNING):
+                logger.info("Skipping drain of worker %s because no dispatch is active", worker_id)
+                return
+            if not dispatcher.has_worker(client):
+                # The dispatcher already excludes it (e.g. it was drained in a previous dispatch cycle)
+                logger.info("Worker %s was already excluded from dispatch, marking it as drained", worker_id)
+                self.drained_client_ids.add(worker_id)
+                client.drained = True
+                return
+
+            receiver_ids = [node_id for node_id in dispatcher.worker_node_ids if node_id != worker_id]
+            if not receiver_ids:
+                logger.error("Cannot drain worker %s: no other worker available to take its users", worker_id)
+                return
+
+            # The drain is committed from here on: mark first so that duplicate
+            # requests and reconnects can never trigger a second replenishment.
+            self.drained_client_ids.add(worker_id)
+            client.drained = True
+
+            base_targets = dispatcher.current_targets()
+            final_targets = dispatcher.drain_worker(client)
+
+            replenishment = sum(
+                final_targets[node_id][user_class] - base_targets[node_id][user_class]
+                for node_id in receiver_ids
+                for user_class in final_targets[node_id]
+            )
+            logger.info(
+                "Draining worker %s (index %d): stopping its users (stop_timeout=%s) and replenishing %d users "
+                "on %d worker(s) at %.2f users/s",
+                worker_id,
+                self.get_worker_index(worker_id),
+                self.environment.stop_timeout,
+                replenishment,
+                len(receiver_ids),
+                spawn_rate,
+            )
+
+            # 1) Immediately tell the drained worker to stop ALL its users. The worker
+            #    diffs this absolute zero target against its running users and stops
+            #    them through the regular stop_users path (honoring stop_timeout).
+            self._send_spawn_targets({worker_id: final_targets[worker_id]})
+
+            # 2) Rate-limited replenishment on the remaining workers. Targets are
+            #    absolute and only ever increment, so other workers' sessions are safe.
+            self._ramp_drain_replenishment(worker_id, base_targets, final_targets, spawn_rate)
+
+            # 3) Wait for the workers to report the commanded state.
+            self._wait_for_drain_reports(worker_id, final_targets)
+
+            logger.info("Worker %s drained; it stays connected but carries no load", worker_id)
+        finally:
+            self._draining_client_id = None
+
+    def _ramp_drain_replenishment(
+        self,
+        drained_id: str,
+        base_targets: dict[str, dict[str, int]],
+        final_targets: dict[str, dict[str, int]],
+        spawn_rate: float,
+    ) -> None:
+        class_names = sorted(next(iter(final_targets.values())).keys())
+        receiver_ids = sorted(node_id for node_id in final_targets if node_id != drained_id)
+
+        remaining = {
+            node_id: {
+                name: max(0, final_targets[node_id][name] - base_targets[node_id][name]) for name in class_names
+            }
+            for node_id in receiver_ids
+        }
+
+        # Class-interleaved, per-worker round-robin assignment order, so each user
+        # class is replenished proportionally under the rate cap.
+        assignments: list[tuple[str, str]] = []
+        while True:
+            produced_any = False
+            for name in class_names:
+                for node_id in receiver_ids:
+                    if remaining[node_id][name] > 0:
+                        assignments.append((node_id, name))
+                        remaining[node_id][name] -= 1
+                        produced_any = True
+            if not produced_any:
+                break
+
+        current_targets = {node_id: dict(base_targets[node_id]) for node_id in receiver_ids}
+        step = max(1, math.floor(spawn_rate))
+        wait_between_rounds = step / spawn_rate
+
+        for round_start in range(0, len(assignments), step):
+            if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
+                logger.info("Interrupting drain replenishment because the test is no longer running")
+                return
+            changed_node_ids: set[str] = set()
+            for node_id, name in assignments[round_start : round_start + step]:
+                current_targets[node_id][name] += 1
+                changed_node_ids.add(node_id)
+            self._send_spawn_targets({node_id: current_targets[node_id] for node_id in changed_node_ids})
+            if round_start + step < len(assignments):
+                gevent.sleep(wait_between_rounds)
+
+    def _wait_for_drain_reports(
+        self, drained_id: str, final_targets: dict[str, dict[str, int]]
+    ) -> None:
+        if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
+            return
+        receiver_ids = [node_id for node_id in final_targets if node_id != drained_id]
+        deadline = time.time() + self.environment.stop_timeout + self._wait_for_workers_report_after_ramp_up()
+        while time.time() < deadline:
+            if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
+                return
+            drained_node = self.clients.get(drained_id)
+            if drained_node is not None and drained_node.user_count == 0:
+                if all(
+                    self.clients[node_id].user_classes_count == final_targets[node_id]
+                    for node_id in receiver_ids
+                    if node_id in self.clients
+                ):
+                    return
+            gevent.sleep(0.05)
+        logger.warning(
+            "Timed out waiting for workers to report their drained/replenished state after draining %s", drained_id
+        )
+
+    def _build_spawn_message(
+        self, worker_node_id: str, worker_user_classes_count: dict[str, int]
+    ) -> Message:
+        # copy the target map: the message is delivered by a spawn_later(0) greenlet,
+        # and the caller may mutate its own target dict before the greenlet actually runs
+        worker_user_classes_count = dict(worker_user_classes_count)
+        data = {
+            "timestamp": time.time(),
+            "user_classes_count": worker_user_classes_count,
+            "host": self.environment.host,
+            "stop_timeout": self.environment.stop_timeout,
+            "parsed_options": vars(self.environment.parsed_options) if self.environment.parsed_options else {},
+        }
+        return Message("spawn", data, worker_node_id)
+
+    def _send_spawn_targets(self, targets: dict[str, dict[str, int]]) -> None:
+        """Send absolute per-worker user-class targets as spawn messages."""
+        dispatch_greenlets = Group()
+        for worker_node_id, worker_user_classes_count in targets.items():
+            dispatch_greenlets.add(
+                gevent.spawn_later(
+                    0,
+                    self.server.send_to_client,
+                    self._build_spawn_message(worker_node_id, worker_user_classes_count),
+                )
+            )
+        dispatch_greenlets.join()
+
     def stop(self, send_stop_to_client: bool = True) -> None:
         if self.state not in [STATE_INIT, STATE_STOPPED, STATE_STOPPING]:
             logger.debug("Stopping...")
@@ -887,6 +1206,10 @@ class MasterRunner(DistributedRunner):
                 self.shape_greenlet.kill(block=True)
                 self.shape_greenlet = None
                 self.shape_last_tick = None
+
+            # Interrupt any in-flight drain and clear its bookkeeping before stopping.
+            # stop is sent to clients.all below, so drained workers are stopped too.
+            self._reset_worker_draining()
 
             self._users_dispatcher = None
 
@@ -941,7 +1264,11 @@ class MasterRunner(DistributedRunner):
                     logger.info(f"Worker {str(client.id)} failed to send heartbeat, setting state to missing.")
                     client.state = STATE_MISSING
                     client.user_classes_count = {}
-                    if self._users_dispatcher is not None:
+                    if client.id in self.drained_client_ids:
+                        # A drained worker carries no users: there is nothing to rebalance.
+                        # The drain marker is kept so that a reconnect cannot reintroduce it.
+                        logger.info(f"Drained worker {str(client.id)} went missing; no users to rebalance.")
+                    elif self._users_dispatcher is not None:
                         self._users_dispatcher.remove_worker(client)
                         if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
                             self.start(self.target_user_count, self.spawn_rate)
@@ -954,10 +1281,19 @@ class MasterRunner(DistributedRunner):
 
             # if there are any missing clients to be removed then remove them and trigger rebalance.
             if len(missing_clients_to_be_removed) > 0:
+                removed_load_bearing_worker = False
                 for to_remove_client_id in missing_clients_to_be_removed:
                     if self.clients.get(to_remove_client_id) is not None:
+                        # A drained worker has no users in the dispatcher, so its removal
+                        # must not trigger a rebalance or a second replenishment.
+                        if to_remove_client_id in self.drained_client_ids:
+                            self._discard_worker_drain_state(to_remove_client_id)
+                        else:
+                            removed_load_bearing_worker = True
                         del self.clients[to_remove_client_id]
-                if self.state == STATE_RUNNING or self.state == STATE_SPAWNING:
+                if removed_load_bearing_worker and (
+                    self.state == STATE_RUNNING or self.state == STATE_SPAWNING
+                ):
                     # _users_dispatcher is set to none so that during redistribution the dead clients are not picked, alternative is to call self.stop() before start
                     self._users_dispatcher = None
                     # trigger redistribution after missing cclient removal
@@ -1032,8 +1368,14 @@ class MasterRunner(DistributedRunner):
                 self.send_message("ack", client_id=client_id, data={"index": self.get_worker_index(client_id)})
                 self.environment.events.worker_connect.fire(client_id=msg.node_id)
                 client_already_connected = client_id in self.clients
+                is_drained = client_id in self.drained_client_ids
                 self.clients[client_id] = WorkerNode(client_id, heartbeat_liveness=HEARTBEAT_LIVENESS)
-                if self._users_dispatcher is not None:
+                if is_drained:
+                    # A reconnecting drained worker must stay out of the dispatch rotation;
+                    # never add it back or trigger a dispatch (which could replenish twice).
+                    self.clients[client_id].drained = True
+                    logger.info(f"Drained worker {client_id} reconnected; it stays out of load until undrained.")
+                elif self._users_dispatcher is not None:
                     self._users_dispatcher.add_worker(worker_node=self.clients[client_id])
                     if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
                         # TODO: Test this situation
@@ -1046,7 +1388,12 @@ class MasterRunner(DistributedRunner):
                     logger.info(
                         f"{client_id} (index {self.get_worker_index(client_id)}) reported as ready. {len(self.clients.ready + self.clients.running + self.clients.spawning)} workers connected."
                     )
-                if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
+                if (
+                    not is_drained
+                    and self.rebalancing_enabled()
+                    and self.state == STATE_RUNNING
+                    and self.spawning_completed
+                ):
                     self.start(self.target_user_count, self.spawn_rate)
                 # emit a warning if the worker's clock seem to be out of sync with our clock
                 # if abs(time() - msg.data["time"]) > 5.0:
@@ -1100,8 +1447,10 @@ class MasterRunner(DistributedRunner):
                     logger.warning(f"Received {msg.type} message from an unknown worker: {msg.node_id}.")
                     return
                 client = self.clients[msg.node_id]
+                was_drained = msg.node_id in self.drained_client_ids
                 del self.clients[msg.node_id]
-                if self._users_dispatcher is not None:
+                self._discard_worker_drain_state(msg.node_id)
+                if not was_drained and self._users_dispatcher is not None:
                     self._users_dispatcher.remove_worker(client)
                     if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
                         # TODO: Test this situation
@@ -1114,7 +1463,7 @@ class MasterRunner(DistributedRunner):
                     client_state = msg.data["state"]
                     if c.state == STATE_MISSING:
                         logger.info(f"Worker {str(c.id)} self-healed with heartbeat, setting state to {client_state}.")
-                        if self._users_dispatcher is not None:
+                        if c.id not in self.drained_client_ids and self._users_dispatcher is not None:
                             self._users_dispatcher.add_worker(worker_node=c)
                             if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
                                 # TODO: Test this situation
@@ -1150,8 +1499,10 @@ class MasterRunner(DistributedRunner):
             case "quit":
                 if msg.node_id in self.clients:
                     client = self.clients[msg.node_id]
+                    was_drained = msg.node_id in self.drained_client_ids
                     del self.clients[msg.node_id]
-                    if self._users_dispatcher is not None:
+                    self._discard_worker_drain_state(msg.node_id)
+                    if not was_drained and self._users_dispatcher is not None:
                         self._users_dispatcher.remove_worker(client)
                         if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
                             # TODO: Test this situation
@@ -1187,7 +1538,14 @@ class MasterRunner(DistributedRunner):
 
     @property
     def worker_count(self) -> int:
-        return len(self.clients.ready) + len(self.clients.spawning) + len(self.clients.running)
+        # Drained workers stay connected but carry no load, so they don't count.
+        return len(
+            [
+                client
+                for client in self.clients.ready + self.clients.spawning + self.clients.running
+                if client.id not in self.drained_client_ids
+            ]
+        )
 
     @property
     def reported_user_classes_count(self) -> dict[str, int]:

@@ -122,6 +122,19 @@ class UsersDispatcher(Iterator):
         return sum(map(sum, map(dict.values, self._users_on_workers.values())))
 
     @property
+    def worker_node_ids(self) -> list[str]:
+        """IDs of the workers currently in the dispatch rotation (drained workers excluded)."""
+        return [worker_node.id for worker_node in self._worker_nodes]
+
+    def has_worker(self, worker_node: WorkerNode) -> bool:
+        """:returns: Whether the given worker is part of the dispatch rotation."""
+        return any(w.id == worker_node.id for w in self._worker_nodes)
+
+    def current_targets(self) -> dict[str, dict[str, int]]:
+        """:returns: A copy of the current absolute per-worker, per-class target map."""
+        return self._fast_users_on_workers_copy(self._users_on_workers)
+
+    @property
     def dispatch_in_progress(self) -> bool:
         return self._dispatch_in_progress
 
@@ -240,6 +253,88 @@ class UsersDispatcher(Iterator):
             # TODO: Test this
             return
         self._prepare_rebalance()
+
+    def drain_worker(self, worker_node: WorkerNode) -> dict[str, dict[str, int]]:
+        """
+        Take a worker out of load ("drain" it) without touching the users on any
+        other worker. The drained worker's per-class counts are redistributed as
+        **increments** (round-robin per user class) onto the remaining workers, so
+        every other worker's counts only grow and no existing user session elsewhere
+        is stopped.
+
+        Unlike :meth:`remove_worker`, this never flags a full rebalance: the drained
+        worker is removed from the rotation but kept in the per-worker accounting map
+        with all-zero counts, so the master keeps addressing it with an absolute zero
+        target. The total user count is preserved.
+
+        :param worker_node: The worker to drain.
+        :return: The new absolute per-worker, per-class user target map.
+        """
+        try:
+            drained_index = next(i for i, w in enumerate(self._worker_nodes) if w.id == worker_node.id)
+        except StopIteration:
+            raise ValueError(f"Worker {worker_node.id} is not part of the dispatcher")
+
+        remaining_nodes = self._worker_nodes[:drained_index] + self._worker_nodes[drained_index + 1 :]
+        if not remaining_nodes:
+            raise ValueError("Cannot drain the only remaining worker of the dispatcher")
+
+        drained_counts = self._users_on_workers[worker_node.id]
+
+        # The active users belonging to the drained worker are removed and equivalent
+        # users are appended onto the receiving workers, so LIFO ramp-down keeps a
+        # consistent view where the newly redistributed users are stopped first.
+        self._active_users = [pair for pair in self._active_users if pair[0].id != worker_node.id]
+
+        for user_class_name in sorted(drained_counts):
+            user_count_to_redistribute = drained_counts[user_class_name]
+            node_gen = itertools.cycle(remaining_nodes)
+            for _ in range(user_count_to_redistribute):
+                receiving_node = next(node_gen)
+                self._users_on_workers[receiving_node.id][user_class_name] += 1
+                self._active_users.append((receiving_node, user_class_name))
+
+        # Keep the drained worker in the accounting with zero users, so dispatch
+        # iterations still yield an explicit zero target for it.
+        self._users_on_workers[worker_node.id] = {
+            user_class.__name__: 0 for user_class in self._original_user_classes
+        }
+
+        self._worker_nodes = remaining_nodes
+        self._sort_workers()
+        self._worker_node_generator = itertools.cycle(self._worker_nodes)
+
+        self._current_user_count = self.get_current_user_count()
+
+        return self._fast_users_on_workers_copy(self._users_on_workers)
+
+    def readd_worker(self, worker_node: WorkerNode) -> None:
+        """
+        Reverse of :meth:`drain_worker`: re-admit a previously drained worker into
+        the dispatch rotation, carrying zero users. Nobody else's counts are changed
+        (no users get moved back or stopped), so existing sessions on other workers
+        are preserved. The worker will pick up users on subsequent ramp-ups.
+
+        Idempotent: re-adding a worker that is already part of the dispatcher is a no-op.
+
+        :param worker_node: The drained worker to re-admit.
+        """
+        if any(w.id == worker_node.id for w in self._worker_nodes):
+            return
+
+        self._worker_nodes.append(worker_node)
+        self._sort_workers()
+        self._worker_node_generator = itertools.cycle(self._worker_nodes)
+
+        if worker_node.id not in self._users_on_workers:
+            self._users_on_workers[worker_node.id] = {
+                user_class.__name__: 0 for user_class in self._original_user_classes
+            }
+        else:
+            for user_class_name in self._users_on_workers[worker_node.id]:
+                self._users_on_workers[worker_node.id][user_class_name] = 0
+
+        self._current_user_count = self.get_current_user_count()
 
     def _prepare_rebalance(self) -> None:
         """

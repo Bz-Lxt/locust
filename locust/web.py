@@ -36,7 +36,7 @@ from . import argument_parser, stats
 from .contrib import fasthttp
 from .html import DEFAULT_BUILD_PATH, get_html_report, render_template_from
 from .log import get_logs, greenlet_exception_logger
-from .runners import STATE_MISSING, STATE_RUNNING, MasterRunner
+from .runners import STATE_MISSING, STATE_RUNNING, MasterRunner, WorkerDrainInProgress
 from .user.inspectuser import get_ratio
 from .user.users import HttpUser
 from .util.cache import memoize
@@ -370,6 +370,75 @@ class WebUI:
                 environment.runner.stop()
             return jsonify({"success": True, "message": "Test stopped"})
 
+        @app_blueprint.route("/drain", methods=["POST"])
+        @self.auth_required_if_enabled
+        def drain() -> Response:
+            runner = environment.runner
+            if not isinstance(runner, MasterRunner):
+                return (
+                    jsonify({"success": False, "message": "Worker draining is only available when running as a master"}),
+                    400,
+                )
+
+            worker_id = request.form.get("worker_id")
+            if not worker_id:
+                return jsonify({"success": False, "message": "Missing worker_id from /drain request"}), 400
+
+            spawn_rate: float | None = None
+            spawn_rate_raw = request.form.get("spawn_rate")
+            if spawn_rate_raw:
+                try:
+                    spawn_rate = float(spawn_rate_raw)
+                except ValueError:
+                    err_msg = f"Invalid spawn_rate value: {spawn_rate_raw!r} (must be a number)"
+                    logger.error(err_msg)
+                    return jsonify({"success": False, "message": err_msg}), 400
+
+            try:
+                runner.drain_worker(worker_id, spawn_rate=spawn_rate)
+            except LookupError as e:
+                return jsonify({"success": False, "message": str(e)}), 404
+            except ValueError as e:
+                return jsonify({"success": False, "message": str(e)}), 400
+            return jsonify(
+                {
+                    "success": True,
+                    "message": (
+                        f"Worker {worker_id} is draining: its users will be stopped and replenished "
+                        f"on the other workers"
+                    ),
+                    "worker_id": worker_id,
+                }
+            )
+
+        @app_blueprint.route("/undrain", methods=["POST"])
+        @self.auth_required_if_enabled
+        def undrain() -> Response:
+            runner = environment.runner
+            if not isinstance(runner, MasterRunner):
+                return (
+                    jsonify({"success": False, "message": "Worker draining is only available when running as a master"}),
+                    400,
+                )
+
+            worker_id = request.form.get("worker_id")
+            if not worker_id:
+                return jsonify({"success": False, "message": "Missing worker_id from /undrain request"}), 400
+
+            try:
+                runner.undrain_worker(worker_id)
+            except LookupError as e:
+                return jsonify({"success": False, "message": str(e)}), 404
+            except WorkerDrainInProgress as e:
+                return jsonify({"success": False, "message": str(e)}), 409
+            return jsonify(
+                {
+                    "success": True,
+                    "message": f"Worker {worker_id} is back in the pool of schedulable workers",
+                    "worker_id": worker_id,
+                }
+            )
+
         @app_blueprint.route("/stats/reset")
         @self.auth_required_if_enabled
         def reset_stats() -> str:
@@ -522,6 +591,7 @@ class WebUI:
                         "user_count": worker.user_count,
                         "cpu_usage": worker.cpu_usage,
                         "memory_usage": worker.memory_usage,
+                        "drained": worker.drained,
                     }
                     for worker in environment.runner.clients.values()
                 ]

@@ -150,6 +150,81 @@ the messages will simply be handled by the runner that sends them.
 For more details, see the `complete example <https://github.com/locustio/locust/tree/master/examples/custom_messages.py>`_.
 
 
+Draining a worker node (rolling maintenance)
+=============================================
+
+During a long-running distributed test you may want to take a single worker out of
+service, for example to restart or upgrade it, without stopping the whole test or
+losing the total user load. The master can *drain* a specific online worker:
+
+- The drained worker stays connected and keeps reporting stats, but all of its users
+  are stopped. The stopping honors ``stop_timeout``, so users stuck in long tasks are
+  force-stopped once that timeout has elapsed.
+- The users it was running are replenished, **per user class**, on the other online
+  workers. Spawning is rate limited (``spawn_rate`` users/s, rounded per round) and is
+  sent as higher absolute user targets, so the existing user sessions on the other
+  workers are never stopped or restarted.
+- Drain requests are processed one worker at a time. You can queue several workers and
+  they will be drained sequentially.
+- Draining is idempotent: repeating a drain request for an already drained, queued or
+  draining worker is a no-op, and a worker that disconnects and reconnects while marked
+  as drained will not receive users again (and is not replenished twice).
+- Stopping the test (``master.stop()`` / the Stop button) immediately interrupts any
+  drain in progress.
+- At least one other online (non-drained, non-queued) worker must exist; the last
+  load-bearing worker cannot be drained.
+
+A drained worker can be made schedulable again with *undrain*. This only re-admits the
+worker into the scheduling pool — it does **not** move users back onto it; the worker
+will pick up users on the next ramp-up, rebalance or ``start()`` with a higher user
+count. A queued (not yet started) drain can be cancelled with undrain. Undraining a
+worker that is currently being drained raises/returns a conflict instead; wait for the
+drain to finish first.
+
+Python API
+----------
+
+.. code-block:: python
+
+    from locust import events
+    from locust.runners import MasterRunner
+
+    @events.init.add_listener
+    def on_locust_init(environment, **kwargs):
+        if environment.runner and isinstance(environment.runner, MasterRunner):
+            # replenish the drained worker's users at 20 users/s (defaults to the
+            # current test's spawn rate when omitted)
+            environment.runner.drain_worker("worker_id_1", spawn_rate=20)
+
+            # put it back into the pool of schedulable workers (no users are moved back)
+            environment.runner.undrain_worker("worker_id_1")
+
+``drain_worker`` raises ``LookupError`` for an unknown worker id, ``ValueError`` when no
+test is running, when the spawn rate is invalid, or when no other online worker can take
+the users, and ``undrain_worker`` raises ``WorkerDrainInProgress`` while the drain is
+still running.
+
+REST API
+--------
+
+Worker ids are listed by the ``id`` field of each entry in ``workers`` from
+``GET /stats/requests`` (drained workers also carry ``"drained": true``).
+
+.. code-block:: bash
+
+    # drain a worker, replenishing its users at up to 20 users/s
+    curl -X POST http://localhost:8089/drain -d "worker_id=worker_id_1" -d "spawn_rate=20"
+
+    # make the worker schedulable again
+    curl -X POST http://localhost:8089/undrain -d "worker_id=worker_id_1"
+
+Both endpoints are only available on master runs and require authentication when
+``--web-login`` is enabled. They respond with JSON ``{"success": ..., "message": ...}``.
+Status codes: ``200`` success (also for idempotent repeats/no-ops), ``400`` invalid
+request (missing/invalid parameters, non-master run, no other online worker),
+``404`` unknown worker id, ``409`` undrain requested while that worker is draining.
+
+
 Running distributed with Docker
 =============================================
 

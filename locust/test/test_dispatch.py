@@ -4157,6 +4157,188 @@ class TestFloatWeithts(unittest.TestCase):
                     self.assertDictEqual(x, next(users_dispatcher))
 
 
+class TestDrainWorker(unittest.TestCase):
+    def _dispatcher_at_steady_state(self, user_classes, target_user_count, num_workers=3):
+        worker_nodes = [WorkerNode(str(i + 1)) for i in range(num_workers)]
+        users_dispatcher = UsersDispatcher(worker_nodes=worker_nodes, user_classes=user_classes)
+        users_dispatcher.new_dispatch(target_user_count=target_user_count, spawn_rate=1000)
+        users_dispatcher._wait_between_dispatch = 0
+        # Consume the whole dispatch cycle to reach the steady state
+        list(users_dispatcher)
+        return worker_nodes, users_dispatcher
+
+    def test_drain_worker_redistributes_each_class_as_increments(self):
+        class User1(User):
+            weight = 1
+
+        class User2(User):
+            weight = 1
+
+        worker_nodes, users_dispatcher = self._dispatcher_at_steady_state([User1, User2], 6)
+
+        before = {
+            worker_id: dict(counts) for worker_id, counts in users_dispatcher._users_on_workers.items()
+        }
+        # 6 users round-robin over 3 workers: 2 users per worker, 1 of each class
+        self.assertDictEqual(
+            before,
+            {
+                "1": {"User1": 1, "User2": 1},
+                "2": {"User1": 1, "User2": 1},
+                "3": {"User1": 1, "User2": 1},
+            },
+        )
+
+        new_targets = users_dispatcher.drain_worker(worker_nodes[1])
+
+        # The drained worker keeps a zeroed accounting entry ...
+        self.assertDictEqual(new_targets["2"], {"User1": 0, "User2": 0})
+        # ... and its users are redistributed round-robin (starting with worker "1")
+        # as increments on the remaining workers.
+        self.assertDictEqual(new_targets["1"], {"User1": 2, "User2": 2})
+        self.assertDictEqual(new_targets["3"], {"User1": 1, "User2": 1})
+
+        # Total user count and per-class totals are preserved
+        self.assertDictEqual(_aggregate_dispatched_users(new_targets), {"User1": 3, "User2": 3})
+        self.assertEqual(_user_count(new_targets), 6)
+
+        # No remaining worker has fewer users of any class than before the drain
+        for worker_id in ("1", "3"):
+            for user_class_name in ("User1", "User2"):
+                self.assertGreaterEqual(
+                    new_targets[worker_id][user_class_name], before[worker_id][user_class_name]
+                )
+
+        # The returned map is a copy of the internal state
+        self.assertDictEqual(new_targets, users_dispatcher._users_on_workers)
+
+        # The drained worker is out of the rotation and out of _active_users
+        self.assertNotIn("2", [w.id for w in users_dispatcher._worker_nodes])
+        self.assertEqual(6, len(users_dispatcher._active_users))
+        self.assertTrue(all(pair[0].id != "2" for pair in users_dispatcher._active_users))
+
+        # No full rebalance must be flagged (that would reshuffle everyone)
+        self.assertFalse(users_dispatcher._rebalance)
+
+    def test_drained_worker_gets_no_users_on_subsequent_dispatch(self):
+        class User1(User):
+            weight = 1
+
+        class User2(User):
+            weight = 1
+
+        worker_nodes, users_dispatcher = self._dispatcher_at_steady_state([User1, User2], 6)
+        users_dispatcher.drain_worker(worker_nodes[1])
+
+        # A new dispatch at the same target immediately yields the steady state,
+        # nobody is reduced and the drained worker stays at zero.
+        users_dispatcher.new_dispatch(target_user_count=6, spawn_rate=1000)
+        users_dispatcher._wait_between_dispatch = 0
+        dispatched_users = next(users_dispatcher)
+        self.assertDictEqual(
+            dispatched_users,
+            {
+                "1": {"User1": 2, "User2": 2},
+                "2": {"User1": 0, "User2": 0},
+                "3": {"User1": 1, "User2": 1},
+            },
+        )
+
+        # Ramp up: new users are only spawned on non-drained workers
+        users_dispatcher.new_dispatch(target_user_count=9, spawn_rate=1000)
+        users_dispatcher._wait_between_dispatch = 0
+        final_targets = list(users_dispatcher)[-1]
+        self.assertDictEqual(final_targets["2"], {"User1": 0, "User2": 0})
+        self.assertEqual(_user_count(final_targets), 9)
+        self.assertEqual(_user_count_on_worker(final_targets, "1") + _user_count_on_worker(final_targets, "3"), 9)
+
+    def test_readd_worker_reinstates_it_without_moving_sessions(self):
+        class User1(User):
+            weight = 1
+
+        class User2(User):
+            weight = 1
+
+        worker_nodes, users_dispatcher = self._dispatcher_at_steady_state([User1, User2], 6)
+        users_dispatcher.drain_worker(worker_nodes[1])
+        after_drain = {
+            worker_id: dict(counts) for worker_id, counts in users_dispatcher._users_on_workers.items()
+        }
+        users_dispatcher.readd_worker(worker_nodes[1])
+
+        self.assertIn("2", [w.id for w in users_dispatcher._worker_nodes])
+        self.assertDictEqual(users_dispatcher._users_on_workers["2"], {"User1": 0, "User2": 0})
+
+        # Same-total dispatch after re-add: nobody else's targets are reduced
+        # (compared with the state right before the re-add, i.e. no session migration)
+        users_dispatcher.new_dispatch(target_user_count=6, spawn_rate=1000)
+        users_dispatcher._wait_between_dispatch = 0
+        dispatched_users = next(users_dispatcher)
+        for worker_id in ("1", "3"):
+            for user_class_name in ("User1", "User2"):
+                self.assertEqual(
+                    dispatched_users[worker_id][user_class_name], after_drain[worker_id][user_class_name]
+                )
+        self.assertDictEqual(dispatched_users["2"], {"User1": 0, "User2": 0})
+
+        # Ramp up: the re-added worker picks up new users again
+        users_dispatcher.new_dispatch(target_user_count=9, spawn_rate=1000)
+        users_dispatcher._wait_between_dispatch = 0
+        final_targets = list(users_dispatcher)[-1]
+        self.assertGreater(_user_count_on_worker(final_targets, "2"), 0)
+        self.assertEqual(_user_count(final_targets), 9)
+
+        # Re-adding is idempotent
+        users_dispatcher.readd_worker(worker_nodes[1])
+        self.assertEqual(3, len(users_dispatcher._worker_nodes))
+
+    def test_drain_worker_validation(self):
+        class User1(User):
+            weight = 1
+
+        worker_nodes, users_dispatcher = self._dispatcher_at_steady_state([User1], 6)
+
+        # Draining an unknown / already-drained worker raises
+        users_dispatcher.drain_worker(worker_nodes[1])
+        self.assertRaises(ValueError, users_dispatcher.drain_worker, worker_nodes[1])
+        self.assertRaises(ValueError, users_dispatcher.drain_worker, WorkerNode("42"))
+
+        # Draining the only remaining worker raises
+        users_dispatcher.drain_worker(worker_nodes[0])
+        self.assertRaises(ValueError, users_dispatcher.drain_worker, worker_nodes[2])
+
+    def test_drain_readd_drain_lifecycle(self):
+        class User1(User):
+            weight = 1
+
+        worker_nodes, users_dispatcher = self._dispatcher_at_steady_state([User1], 6)
+        users_dispatcher.drain_worker(worker_nodes[1])
+        self.assertNotIn("2", [w.id for w in users_dispatcher._worker_nodes])
+        users_dispatcher.readd_worker(worker_nodes[1])
+        # A second drain after re-add works again
+        new_targets = users_dispatcher.drain_worker(worker_nodes[1])
+        self.assertDictEqual(new_targets["2"], {"User1": 0})
+        self.assertEqual(_user_count(new_targets), 6)
+
+    def test_drain_worker_preserves_fixed_user_counts(self):
+        class FixedUser(User):
+            weight = 1
+            fixed_count = 3
+
+        class WeightedUser(User):
+            weight = 1
+
+        worker_nodes, users_dispatcher = self._dispatcher_at_steady_state([FixedUser, WeightedUser], 9)
+        totals_before = _aggregate_dispatched_users(users_dispatcher._users_on_workers)
+        self.assertEqual(3, totals_before["FixedUser"])
+
+        new_targets = users_dispatcher.drain_worker(worker_nodes[1])
+        totals_after = _aggregate_dispatched_users(new_targets)
+        self.assertEqual(3, totals_after["FixedUser"])
+        self.assertEqual(totals_before["WeightedUser"], totals_after["WeightedUser"])
+        self.assertDictEqual(new_targets["2"], {"FixedUser": 0, "WeightedUser": 0})
+
+
 def _aggregate_dispatched_users(d: dict[str, dict[str, int]]) -> dict[str, int]:
     user_classes = list(next(iter(d.values())).keys())
     return {u: sum(d[u] for d in d.values()) for u in user_classes}

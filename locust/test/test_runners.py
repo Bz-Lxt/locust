@@ -17,12 +17,14 @@ from locust.runners import (
     STATE_STOPPED,
     STATE_STOPPING,
     LocalRunner,
+    WorkerDrainInProgress,
     WorkerNode,
     WorkerRunner,
 )
 from locust.stats import RequestStats
 from locust.user import TaskSet, User, task
 
+import itertools
 import json
 import logging
 import random
@@ -3476,6 +3478,628 @@ class TestMasterRunner(LocustRunnerTestCase):
             sleep(0.1)
             server.mocked_send(Message("stats", UNRECOGNIZED_HOST_MESSAGE, "unknown_host"))
             self.assertEqual(3, len(server.get_messages()))
+
+
+class DrainTestUserA(User):
+    wait_time = constant(0.05)
+
+    @task
+    def my_task(self):
+        gevent.sleep(30)
+
+
+class DrainTestUserB(User):
+    wait_time = constant(0.05)
+
+    @task
+    def my_task(self):
+        gevent.sleep(30)
+
+
+class TestMasterWorkerDraining(LocustRunnerTestCase):
+    WORKER_IDS = ("fake_client1", "fake_client2", "fake_client3", "fake_client4")
+
+    def setUp(self):
+        super().setUp()
+        self.environment = Environment(events=locust.events, catch_exceptions=False)
+
+    def new_environment(self):
+        return Environment(events=locust.events, catch_exceptions=False)
+
+    def get_runner(self, user_classes=None, environment=None):
+        environment = environment or self.environment
+        if user_classes is not None:
+            environment.user_classes = user_classes
+        return environment.create_master_runner("*", 5557)
+
+    def _connect_workers(self, server, num_workers):
+        worker_ids = self.WORKER_IDS[:num_workers]
+        for worker_id in worker_ids:
+            server.mocked_send(Message("client_ready", __version__, worker_id))
+        return list(worker_ids)
+
+    def _prepare_running_master(self, server, user_classes, user_count, num_workers=3, spawn_rate=1000):
+        """Spin up a master + workers and drive a start() to a mocked steady state."""
+        master = self.get_runner(user_classes=user_classes)
+        worker_ids = self._connect_workers(server, num_workers)
+        master.start(user_count, spawn_rate)
+        targets = master._users_dispatcher.current_targets()
+        for worker_id in worker_ids:
+            node = master.clients[worker_id]
+            node.state = STATE_RUNNING
+            node.user_classes_count = dict(targets[worker_id])
+        return master, worker_ids, targets
+
+    def _wait_drain_idle(self, master, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline and (master._drain_queue or master._draining_client_id):
+            sleep(0.01)
+        self.assertFalse(master._drain_queue or master._draining_client_id, "drain queue did not become idle in time")
+
+    def _drain_window_messages(self, server, outbox_len_before, worker_id=None, message_type="spawn"):
+        messages = [
+            message
+            for message in server.outbox[outbox_len_before:]
+            if message.type == message_type and (worker_id is None or message.node_id == worker_id)
+        ]
+        return messages
+
+    # ------------------------------------------------------------------
+    # TR-2.1: zero-target stop, no quit, per-class conservation, monotonicity
+    # ------------------------------------------------------------------
+
+    def test_drain_worker_stops_users_and_replenishes_per_class(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, targets = self._prepare_running_master(
+                server, [DrainTestUserA, DrainTestUserB], user_count=12
+            )
+            drained_id, receiver_ids = worker_ids[0], worker_ids[1:]
+            self.assertEqual({"DrainTestUserA": 2, "DrainTestUserB": 2}, targets[drained_id])
+
+            last_spawn_before = [m for m in server.outbox if m.type == "spawn" and m.node_id == drained_id][-1]
+            outbox_len_before = len(server.outbox)
+
+            master.drain_worker(drained_id, spawn_rate=1000)
+            self._wait_drain_idle(master)
+
+            window_messages = server.outbox[outbox_len_before:]
+            # the drained worker is never told to quit
+            self.assertEqual([], [m for m in window_messages if m.type == "quit"])
+
+            drained_spawns = self._drain_window_messages(server, outbox_len_before, drained_id)
+            self.assertTrue(drained_spawns)
+            zero_target = drained_spawns[-1].data["user_classes_count"]
+            self.assertEqual({"DrainTestUserA": 0, "DrainTestUserB": 0}, zero_target)
+            # a fresh timestamp is used so the worker does not dedupe the message
+            self.assertGreater(drained_spawns[-1].data["timestamp"], last_spawn_before.data["timestamp"])
+            # stop_timeout travels with the spawn message (graceful stopping on the worker)
+            self.assertEqual(self.environment.stop_timeout, drained_spawns[-1].data["stop_timeout"])
+
+            # receiver targets only ever grow and end up carrying all the users, per class
+            for receiver_id in receiver_ids:
+                receiver_spawns = self._drain_window_messages(server, outbox_len_before, receiver_id)
+                self.assertTrue(receiver_spawns)
+                previous = targets[receiver_id]
+                for message in receiver_spawns:
+                    current = message.data["user_classes_count"]
+                    self.assertGreaterEqual(current["DrainTestUserA"], previous["DrainTestUserA"])
+                    self.assertGreaterEqual(current["DrainTestUserB"], previous["DrainTestUserB"])
+                    previous = current
+
+            final_targets = master._users_dispatcher.current_targets()
+            self.assertEqual({"DrainTestUserA": 0, "DrainTestUserB": 0}, final_targets[drained_id])
+            replenished_a = sum(final_targets[node_id]["DrainTestUserA"] for node_id in receiver_ids)
+            replenished_b = sum(final_targets[node_id]["DrainTestUserB"] for node_id in receiver_ids)
+            self.assertEqual(6, replenished_a)
+            self.assertEqual(6, replenished_b)
+
+            # the worker stays connected, but it is marked as drained
+            self.assertIn(drained_id, master.clients)
+            self.assertIn(drained_id, master.drained_client_ids)
+            self.assertTrue(master.clients[drained_id].drained)
+
+    # ------------------------------------------------------------------
+    # TR-2.2: rate limited replenishment
+    # ------------------------------------------------------------------
+
+    def test_drain_worker_replenishes_at_the_given_spawn_rate(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            # one worker starts with all 6 users; three idle workers are attached to the
+            # dispatcher without redistributing (their sessions have not ramped yet), so
+            # draining the loaded worker moves all 6 users across at the given rate
+            master = self.get_runner(user_classes=[DrainTestUserA])
+            server.mocked_send(Message("client_ready", __version__, self.WORKER_IDS[0]))
+            sleep(0.05)
+            master.start(6, 1000)
+            master.clients[self.WORKER_IDS[0]].state = STATE_RUNNING
+            master.clients[self.WORKER_IDS[0]].user_classes_count = {"DrainTestUserA": 6}
+
+            dispatcher = master._users_dispatcher
+            for worker_id in self.WORKER_IDS[1:]:
+                node = WorkerNode(worker_id)
+                node.state = STATE_RUNNING
+                master.clients[worker_id] = node
+                dispatcher._worker_nodes.append(node)
+                dispatcher._users_on_workers[worker_id] = {"DrainTestUserA": 0}
+                node.user_classes_count = {"DrainTestUserA": 0}
+            dispatcher._sort_workers()
+            dispatcher._worker_node_generator = itertools.cycle(dispatcher._worker_nodes)
+
+            outbox_len_before = len(server.outbox)
+            started_at = time.time()
+            master.drain_worker(self.WORKER_IDS[0], spawn_rate=2)
+            self._wait_drain_idle(master)
+            elapsed = time.time() - started_at
+
+            receiver_messages = [
+                message
+                for message in server.outbox[outbox_len_before:]
+                if message.type == "spawn" and message.node_id in self.WORKER_IDS[1:]
+            ]
+            # 6 increments at 2/s => 3 rounds (two 1s sleeps between them)
+            self.assertEqual(6, len(receiver_messages))
+            self.assertGreaterEqual(elapsed, 1.8)
+
+            per_receiver_sequences = defaultdict(list)
+            for message in receiver_messages:
+                per_receiver_sequences[message.node_id].append(
+                    message.data["user_classes_count"]["DrainTestUserA"]
+                )
+            for sequence in per_receiver_sequences.values():
+                self.assertEqual([1, 2], sequence)  # started at 0, two increments of at most step (2)
+                for previous, current in zip(sequence, sequence[1:]):
+                    self.assertLessEqual(current - previous, 2)
+
+            final_targets = master._users_dispatcher.current_targets()
+            self.assertEqual(6, sum(target["DrainTestUserA"] for target in final_targets.values()))
+            self.assertEqual(0, final_targets[self.WORKER_IDS[0]]["DrainTestUserA"])
+
+    # ------------------------------------------------------------------
+    # TR-2.4: validation branches
+    # ------------------------------------------------------------------
+
+    def test_drain_worker_validates_arguments(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            # two connected workers but no test running yet
+            master = self.get_runner(user_classes=[DrainTestUserA])
+            server.mocked_send(Message("client_ready", __version__, self.WORKER_IDS[0]))
+            server.mocked_send(Message("client_ready", __version__, self.WORKER_IDS[1]))
+            sleep(0.05)
+            with self.assertRaises(ValueError):
+                master.drain_worker(self.WORKER_IDS[0])
+
+            # start the test with three workers
+            server.mocked_send(Message("client_ready", __version__, self.WORKER_IDS[2]))
+            sleep(0.05)
+            master.start(3, 1000)
+            for worker_id in self.WORKER_IDS[:3]:
+                master.clients[worker_id].state = STATE_RUNNING
+                master.clients[worker_id].user_classes_count = {"DrainTestUserA": 1}
+
+            # unknown worker
+            with self.assertRaises(LookupError):
+                master.drain_worker("does_not_exist")
+            with self.assertRaises(LookupError):
+                master.undrain_worker("does_not_exist")
+
+            # invalid spawn rate
+            outbox_len_before = len(server.outbox)
+            with self.assertRaises(ValueError):
+                master.drain_worker(self.WORKER_IDS[0], spawn_rate=0)
+            with self.assertRaises(ValueError):
+                master.drain_worker(self.WORKER_IDS[0], spawn_rate=-1)
+            self.assertEqual(outbox_len_before, len(server.outbox))
+            self.assertEqual(set(), master.drained_client_ids)
+
+            # no other online worker available to take the users
+            master.clients[self.WORKER_IDS[1]].state = STATE_MISSING
+            master.clients[self.WORKER_IDS[2]].state = STATE_MISSING
+            with self.assertRaises(ValueError):
+                master.drain_worker(self.WORKER_IDS[0])
+
+    # ------------------------------------------------------------------
+    # TR-2.5: idempotency
+    # ------------------------------------------------------------------
+
+    def test_drain_and_undrain_are_idempotent(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, _ = self._prepare_running_master(server, [DrainTestUserA], user_count=6)
+            drained_id = worker_ids[0]
+
+            # repeated call while a slow drain is in flight is a no-op
+            master.drain_worker(drained_id, spawn_rate=1)
+            deadline = time.time() + 2
+            while master._draining_client_id != drained_id and time.time() < deadline:
+                sleep(0.01)
+            self.assertEqual(drained_id, master._draining_client_id)
+            master.drain_worker(drained_id, spawn_rate=1)
+            self.assertEqual(0, len(master._drain_queue))
+            self._wait_drain_idle(master)
+
+            # repeated call after completion is also a no-op
+            outbox_len_before = len(server.outbox)
+            master.drain_worker(drained_id, spawn_rate=1000)
+            sleep(0.05)
+            self.assertEqual(outbox_len_before, len(server.outbox))
+
+            # undraining a worker that was never drained is a no-op
+            other = worker_ids[1]
+            master.undrain_worker(other)
+            self.assertEqual(outbox_len_before, len(server.outbox))
+            self.assertFalse(master.clients[other].drained)
+
+            # undraining a worker mid-drain conflicts: undo the first drain, scale the
+            # test up so the reinstated worker picks up users, then drain it again slowly
+            master.undrain_worker(drained_id)
+            master.start(12, 1000)
+            self.assertGreaterEqual(
+                master._users_dispatcher.current_targets()[drained_id]["DrainTestUserA"], 2
+            )
+            master.drain_worker(drained_id, spawn_rate=1)
+            deadline = time.time() + 2
+            while master._draining_client_id != drained_id and time.time() < deadline:
+                sleep(0.01)
+            with self.assertRaises(WorkerDrainInProgress):
+                master.undrain_worker(drained_id)
+            self._wait_drain_idle(master)
+
+    # ------------------------------------------------------------------
+    # TR-2.6: undo re-admits the worker (no load moved back) and cancels queued drains
+    # ------------------------------------------------------------------
+
+    def test_undrain_readmits_worker_for_future_scaling(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, _ = self._prepare_running_master(server, [DrainTestUserA], user_count=6)
+            drained_id = worker_ids[0]
+
+            master.drain_worker(drained_id, spawn_rate=1000)
+            self._wait_drain_idle(master)
+            self.assertNotIn(drained_id, master._users_dispatcher.worker_node_ids)
+
+            outbox_len_before = len(server.outbox)
+            master.undrain_worker(drained_id)
+            # undrain moves no users and sends no messages
+            self.assertEqual(outbox_len_before, len(server.outbox))
+            self.assertIn(drained_id, master._users_dispatcher.worker_node_ids)
+            self.assertNotIn(drained_id, master.drained_client_ids)
+            self.assertFalse(master.clients[drained_id].drained)
+
+            # a subsequent scale-up schedules users on the reinstated worker
+            master.start(9, 1000)
+            final_targets = master._users_dispatcher.current_targets()
+            self.assertGreater(final_targets[drained_id]["DrainTestUserA"], 0)
+            self.assertEqual(9, sum(target["DrainTestUserA"] for target in final_targets.values()))
+
+    def test_undrain_cancels_a_queued_drain_without_stopping_the_worker(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, targets = self._prepare_running_master(server, [DrainTestUserA], user_count=6)
+            first_drained, cancelled_id = worker_ids[0], worker_ids[1]
+
+            master.drain_worker(first_drained, spawn_rate=1)
+            master.drain_worker(cancelled_id, spawn_rate=1)
+            # cancelled before its queue entry was processed
+            master.undrain_worker(cancelled_id)
+            self.assertNotIn(cancelled_id, master._drain_queue)
+            self._wait_drain_idle(master)
+
+            self.assertIn(first_drained, master.drained_client_ids)
+            self.assertNotIn(cancelled_id, master.drained_client_ids)
+            self.assertFalse(master.clients[cancelled_id].drained)
+            # the cancelled worker never received a zero target (it may have received
+            # increments as a receiver of the other worker's drain)
+            cancelled_spawns = self._drain_window_messages(server, 0, cancelled_id)
+            self.assertTrue(cancelled_spawns)
+            for message in cancelled_spawns:
+                self.assertGreater(message.data["user_classes_count"]["DrainTestUserA"], 0)
+
+    # ------------------------------------------------------------------
+    # TR-3.1: duplicate client_ready of a drained worker dispatches nothing
+    # ------------------------------------------------------------------
+
+    def test_reconnect_of_drained_worker_does_not_dispatch(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, _ = self._prepare_running_master(server, [DrainTestUserA], user_count=6)
+            drained_id = worker_ids[0]
+            master.drain_worker(drained_id, spawn_rate=1000)
+            self._wait_drain_idle(master)
+
+            server.outbox.clear()
+            server.mocked_send(Message("client_ready", __version__, drained_id))
+            sleep(0.1)
+
+            self.assertEqual([], [m for m in server.outbox if m.type == "spawn"])
+            self.assertIn(drained_id, master.drained_client_ids)
+            self.assertTrue(master.clients[drained_id].drained)
+            self.assertNotIn(drained_id, master._users_dispatcher.worker_node_ids)
+
+    # ------------------------------------------------------------------
+    # TR-3.2: heartbeat self-heal of a drained worker does not add/start it
+    # ------------------------------------------------------------------
+
+    def test_drained_worker_heartbeat_self_heal_does_not_dispatch(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, _ = self._prepare_running_master(server, [DrainTestUserA], user_count=6)
+            drained_id = worker_ids[0]
+            master.drain_worker(drained_id, spawn_rate=1000)
+            self._wait_drain_idle(master)
+
+            master.clients[drained_id].state = STATE_MISSING
+            server.outbox.clear()
+            server.mocked_send(
+                Message(
+                    "heartbeat",
+                    {"state": STATE_RUNNING, "current_cpu_usage": 10, "current_memory_usage": 100, "count": 0},
+                    drained_id,
+                )
+            )
+            sleep(0.1)
+
+            self.assertEqual(STATE_RUNNING, master.clients[drained_id].state)
+            self.assertIn(drained_id, master.drained_client_ids)
+            self.assertNotIn(drained_id, master._users_dispatcher.worker_node_ids)
+            self.assertEqual([], [m for m in server.outbox if m.type == "spawn"])
+
+    # ------------------------------------------------------------------
+    # TR-3.3: a drained worker reaching the dead threshold is removed quietly
+    # ------------------------------------------------------------------
+
+    @mock.patch("locust.runners.HEARTBEAT_INTERVAL", new=0.1)
+    @mock.patch("locust.runners.HEARTBEAT_DEAD_INTERNAL", new=-2)
+    def test_dead_drained_worker_is_removed_without_rebalance(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, _ = self._prepare_running_master(server, [DrainTestUserA], user_count=6)
+            drained_id, healthy_ids = worker_ids[0], worker_ids[1:]
+            master.drain_worker(drained_id, spawn_rate=1000)
+            self._wait_drain_idle(master)
+            targets_after_drain = master._users_dispatcher.current_targets()
+            server.outbox.clear()
+
+            keep_sending = [True]
+
+            def send_heartbeats():
+                while keep_sending[0]:
+                    for worker_id in healthy_ids:
+                        server.mocked_send(
+                            Message(
+                                "heartbeat",
+                                {
+                                    "state": STATE_RUNNING,
+                                    "current_cpu_usage": 10,
+                                    "current_memory_usage": 100,
+                                    "count": 3,
+                                },
+                                worker_id,
+                            )
+                        )
+                    sleep(0.05)
+
+            heartbeat_greenlet = gevent.spawn(send_heartbeats)
+            try:
+                with mock.patch.object(master, "start") as mocked_start:
+                    sleep(1.2)
+                    # the drained worker was removed after being dead long enough
+                    self.assertNotIn(drained_id, master.clients)
+                    self.assertNotIn(drained_id, master.drained_client_ids)
+                    # no rebalance / re-dispatch was triggered by its removal
+                    self.assertEqual(0, mocked_start.call_count)
+                # healthy workers keep their targets
+                final_targets = master._users_dispatcher.current_targets()
+                for worker_id in healthy_ids:
+                    self.assertEqual(targets_after_drain[worker_id], final_targets[worker_id])
+                self.assertEqual([], [m for m in server.outbox if m.type == "spawn"])
+            finally:
+                keep_sending[0] = False
+                heartbeat_greenlet.join()
+
+    # ------------------------------------------------------------------
+    # TR-3.5: worker_count excludes drained (but still connected) workers
+    # ------------------------------------------------------------------
+
+    def test_worker_count_excludes_drained_workers(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, _ = self._prepare_running_master(
+                server, [DrainTestUserA, DrainTestUserB], user_count=6
+            )
+            self.assertEqual(3, master.worker_count)
+
+            master.drain_worker(worker_ids[0], spawn_rate=1000)
+            self._wait_drain_idle(master)
+
+            self.assertEqual(2, master.worker_count)
+            self.assertEqual(3, len(master.clients))
+            self.assertIn(worker_ids[0], master.clients)
+
+            # the drained worker keeps reporting heartbeats
+            server.mocked_send(
+                Message(
+                    "heartbeat",
+                    {"state": STATE_RUNNING, "current_cpu_usage": 5, "current_memory_usage": 50, "count": 0},
+                    worker_ids[0],
+                )
+            )
+            self.assertEqual(STATE_RUNNING, master.clients[worker_ids[0]].state)
+
+            master.undrain_worker(worker_ids[0])
+            self.assertEqual(3, master.worker_count)
+
+    # ------------------------------------------------------------------
+    # TR-3.6: a dispatch starting during a drain aborts the ramp without overshooting
+    # ------------------------------------------------------------------
+
+    def test_start_during_drain_aborts_ramp_without_overshoot(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, _ = self._prepare_running_master(server, [DrainTestUserA], user_count=6)
+            drained_id, receiver_ids = worker_ids[0], worker_ids[1:]
+
+            outbox_len_before = len(server.outbox)
+            master.drain_worker(drained_id, spawn_rate=1)
+            # let one ramp round land, then issue a regular dispatch
+            sleep(0.3)
+            master.start(6, 20)
+            self._wait_drain_idle(master)
+
+            self.assertIsNone(master._drain_greenlet)
+            final_targets = master._users_dispatcher.current_targets()
+            self.assertEqual(0, final_targets[drained_id]["DrainTestUserA"])
+            self.assertEqual(6, sum(target["DrainTestUserA"] for target in final_targets.values()))
+
+            # after the drain started the drained worker only ever saw zero targets
+            for message in server.outbox[outbox_len_before:]:
+                if message.type == "spawn" and message.node_id == drained_id:
+                    self.assertEqual(0, message.data["user_classes_count"]["DrainTestUserA"])
+            # receiving workers were never told to run more than the final target
+            for receiver_id in receiver_ids:
+                for message in [m for m in server.outbox if m.type == "spawn" and m.node_id == receiver_id]:
+                    self.assertLessEqual(
+                        message.data["user_classes_count"]["DrainTestUserA"],
+                        final_targets[receiver_id]["DrainTestUserA"],
+                    )
+
+    # ------------------------------------------------------------------
+    # TR-3.4: global stop interrupts an in-flight drain and resets bookkeeping
+    # ------------------------------------------------------------------
+
+    def test_stop_interrupts_in_flight_drain_and_restart_includes_worker(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
+        ):
+            master, worker_ids, _ = self._prepare_running_master(server, [DrainTestUserA], user_count=6)
+            drained_id = worker_ids[0]
+
+            master.drain_worker(drained_id, spawn_rate=1)
+            sleep(0.3)
+            self.assertFalse(master._drain_greenlet.ready())
+
+            # fake workers reporting no users so stop()'s wait loop returns immediately
+            for worker_id in worker_ids:
+                master.clients[worker_id].user_classes_count = {}
+
+            master.stop()
+
+            deadline = time.time() + 1
+            while master._drain_greenlet is not None and not master._drain_greenlet.ready() and time.time() < deadline:
+                sleep(0.01)
+            self.assertTrue(master._drain_greenlet is None or master._drain_greenlet.ready())
+            self.assertEqual(set(), master.drained_client_ids)
+            self.assertEqual(deque(), master._drain_queue)
+            for worker_id in worker_ids:
+                stop_messages = [m for m in server.outbox if m.type == "stop" and m.node_id == worker_id]
+                self.assertTrue(stop_messages, f"worker {worker_id} did not receive a stop message")
+                self.assertFalse(master.clients[worker_id].drained)
+
+            # after a restart the previously drained worker receives users again
+            master.start(6, 1000)
+            final_targets = master._users_dispatcher.current_targets()
+            self.assertGreater(final_targets[drained_id]["DrainTestUserA"], 0)
+
+    # ------------------------------------------------------------------
+    # TR-2.3: real ZMQ integration
+    # ------------------------------------------------------------------
+
+    def test_distributed_drain_integration_run(self):
+        with mock.patch("locust.runners.WORKER_REPORT_INTERVAL", new=0.3):
+            master_env = Environment(
+                user_classes=[DrainTestUserA, DrainTestUserB], events=locust.events, stop_timeout=1
+            )
+            master = master_env.create_master_runner("*", 0)
+            sleep(0)
+
+            workers: list[WorkerRunner] = []
+            for _ in range(3):
+                worker_env = Environment(user_classes=[DrainTestUserA, DrainTestUserB])
+                worker = worker_env.create_worker_runner("127.0.0.1", master.server.port)
+                workers.append(worker)
+            sleep(0.3)
+
+            master.start(6, spawn_rate=1000)
+
+            @retry(AssertionError, tries=20, delay=0.2)
+            def assert_all_workers_at_steady_state():
+                for worker in workers:
+                    assert worker.user_count == 2
+
+            assert_all_workers_at_steady_state()
+
+            drained_worker = workers[0]
+            drained_id = drained_worker.client_id
+            draining_started_at = time.time()
+            master.drain_worker(drained_id, spawn_rate=100)
+
+            @retry(AssertionError, tries=30, delay=0.2)
+            def assert_worker_drained():
+                assert drained_worker.user_count == 0
+                assert sum(worker.user_count for worker in workers[1:]) == 6
+                assert master.clients[drained_id].user_count == 0
+                assert master.user_count == 6
+
+            assert_worker_drained()
+            self._wait_drain_idle(master)
+            # bounded by stop_timeout: blocking users are force-stopped promptly
+            self.assertLess(time.time() - draining_started_at, 8)
+
+            # totals per user class are conserved on the workers
+            reported_a = sum(worker.user_classes_count.get("DrainTestUserA", 0) for worker in workers[1:])
+            reported_b = sum(worker.user_classes_count.get("DrainTestUserB", 0) for worker in workers[1:])
+            self.assertEqual(3, reported_a)
+            self.assertEqual(3, reported_b)
+
+            # the drained worker is still connected but no longer counts as load-bearing
+            self.assertIn(drained_id, master.clients)
+            self.assertEqual(2, master.worker_count)
+
+            # undo and scale up: the reinstated worker picks up new users
+            master.undrain_worker(drained_id)
+            master.start(9, spawn_rate=1000)
+
+            @retry(AssertionError, tries=20, delay=0.2)
+            def assert_scaled_out():
+                assert drained_worker.user_count > 0
+                assert sum(worker.user_count for worker in workers) == 9
+
+            assert_scaled_out()
+
+            master.quit()
+
+            @retry(AssertionError, tries=20, delay=0.2)
+            def assert_all_stopped():
+                for worker in workers:
+                    assert worker.user_count == 0
+
+            assert_all_stopped()
 
 
 class TestWorkerRunner(LocustTestCase):
