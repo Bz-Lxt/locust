@@ -4,13 +4,13 @@ import locust
 from locust.opentelemetry import setup_opentelemetry
 
 import atexit
-import errno
 import gc
 import inspect
 import itertools
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -29,6 +29,7 @@ from .env import Environment
 from .html import get_html_report, process_html_filename
 from .input_events import input_listener
 from .log import greenlet_exception_logger, setup_logging
+from .runners import STATE_MISSING, STATE_RUNNING, STATE_SPAWNING
 from .user.inspectuser import print_task_ratio, print_task_ratio_json
 from .util.load_locustfile import load_locustfile, load_locustfile_pytest
 
@@ -42,7 +43,10 @@ except ModuleNotFoundError as e:
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .runners import MasterRunner
+
 version = locust.__version__
+logger = logging.getLogger(__name__)
 
 # Options to ignore when using a custom shape class without `use_common_options=True`
 # See: https://docs.locust.io/en/stable/custom-load-shape.html#use-common-options
@@ -51,6 +55,332 @@ COMMON_OPTIONS = {
     "spawn_rate": "spawn-rate",
     "run_time": "run-time",
 }
+
+# How long a replacement worker has to complete the handshake (client_ready) before the
+# attempt is considered failed
+WORKER_RESTART_HANDSHAKE_TIMEOUT = 30.0
+# A replacement that completes the handshake but dies within this many seconds still counts
+# as a consecutive failure, preventing endless crash-looping through the attempts budget
+WORKER_RESTART_STABILITY_PERIOD = 30.0
+# How often the supervisor checks whether a worker process is still alive
+WORKER_SUPERVISION_INTERVAL = 0.5
+# How long workers get to shut down on their own before being SIGKILLed
+WORKER_KILL_GRACE_PERIOD = 3.0
+
+
+class LocalWorkerPool:
+    """
+    Supervises the worker processes forked when running with ``--processes``.
+
+    If a worker process exits unexpectedly during a test, the same worker slot is
+    restarted, up to a per-slot budget of consecutive failures (``--worker-restart-attempts``).
+    A replacement is only considered recovered after it has completed its handshake
+    with the master (client_ready), and it is the master that then assigns load to
+    it. If the slot cannot be recovered within the budget, recovery is given up,
+    all worker processes are terminated and Locust exits.
+    """
+
+    def __init__(self, worker_pids: dict[int, int]) -> None:
+        self.runner: MasterRunner | None = None
+        self.master_host = "127.0.0.1"
+        self.master_port = 5557
+        self.max_attempts = 3
+        self.restart_delay = 1.0
+        self.stopped = False
+        self.aborted = False
+        self.slots: dict[int, dict] = {
+            slot: {
+                "pid": pid,
+                "client_id": None,
+                "handshaken_at": None,
+                "recovering": False,
+                "consecutive_failures": 0,
+            }
+            for slot, pid in worker_pids.items()
+        }
+
+    def attach(
+        self,
+        runner: MasterRunner,
+        master_host: str,
+        master_port: int,
+        max_attempts: int,
+        restart_delay: float,
+    ) -> None:
+        self.runner = runner
+        self.master_host = master_host
+        self.master_port = master_port
+        self.max_attempts = max_attempts
+        self.restart_delay = restart_delay
+
+    def stop(self, **kwargs) -> None:
+        """Called when Locust starts shutting down, so no more restarts are attempted."""
+        self.stopped = True
+
+    @property
+    def live_pids(self) -> list[int]:
+        return [slot_state["pid"] for slot_state in self.slots.values() if slot_state["pid"] is not None]
+
+    def supervise(self) -> None:
+        while not self.stopped:
+            if self.runner is not None and self.runner.state in (STATE_SPAWNING, STATE_RUNNING):
+                self._track_handshakes()
+                for slot, slot_state in self.slots.items():
+                    if slot_state["recovering"] or slot_state["pid"] is None:
+                        continue
+                    pid = slot_state["pid"]
+                    try:
+                        reaped_pid, status = os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        # already reaped by someone else (e.g. shutdown handler)
+                        slot_state["pid"] = None
+                        continue
+                    if reaped_pid != 0:
+                        exit_code = os.waitstatus_to_exitcode(status)
+                        slot_state["recovering"] = True
+                        gevent.spawn(self._recover_slot, slot, exit_code)
+            gevent.sleep(WORKER_SUPERVISION_INTERVAL)
+
+    def _track_handshakes(self) -> None:
+        """Record which master client id belongs to which slot once it shows up."""
+        assert self.runner is not None
+        for slot, slot_state in self.slots.items():
+            if slot_state["recovering"]:
+                continue
+            marker = f"_slot{slot}_"
+            for client in self.runner.clients.all:
+                if client.state == STATE_MISSING:
+                    continue
+                if marker in client.id and client.id != slot_state["client_id"]:
+                    slot_state["client_id"] = client.id
+                    slot_state["handshaken_at"] = time.time()
+
+    def _recover_slot(self, slot: int, exit_code: int) -> None:
+        slot_state = self.slots[slot]
+        # A worker that had been up for a while starts a fresh failure budget. One that
+        # died before (or shortly after) completing its handshake counts as consecutive.
+        if (
+            slot_state["handshaken_at"] is not None
+            and time.time() - slot_state["handshaken_at"] >= WORKER_RESTART_STABILITY_PERIOD
+        ):
+            slot_state["consecutive_failures"] = 1
+        else:
+            slot_state["consecutive_failures"] += 1
+        logger.error(
+            f"Worker in slot {slot} (pid {slot_state['pid']}) exited unexpectedly with code "
+            f"{exit_code} (consecutive failure #{slot_state['consecutive_failures']})."
+        )
+        slot_state["pid"] = None
+        assert self.runner is not None
+        try:
+            while not self.stopped:
+                if slot_state["consecutive_failures"] > self.max_attempts:
+                    self._abort(slot)
+                    return
+                logger.info(
+                    f"Restarting worker in slot {slot} "
+                    f"(attempt {slot_state['consecutive_failures']} of {self.max_attempts})"
+                )
+                gevent.sleep(self.restart_delay)
+                if self.stopped:
+                    return
+                try:
+                    # only clients appearing after this point can belong to the new process,
+                    # since master nodes of earlier generations linger until they go MISSING
+                    known_client_ids = {client.id for client in self.runner.clients.all}
+                    pid = self._start_worker_process(slot)
+                except OSError:
+                    logger.error(f"Failed to start replacement worker for slot {slot}: {traceback.format_exc()}")
+                    slot_state["consecutive_failures"] += 1
+                    continue
+                slot_state["pid"] = pid
+                if not self._wait_for_handshake(slot, pid, known_client_ids):
+                    # never completed the handshake in time (or died before doing so)
+                    self._kill_pid(pid)
+                    slot_state["pid"] = None
+                    slot_state["consecutive_failures"] += 1
+                    continue
+                # The slot stays "recovering" (and therefore invisible to the supervisor)
+                # until the replacement has actually taken over load and survived a brief
+                # guard period. If it dies during that time, this same greenlet restarts
+                # it instead of spawning a second recovery for the same slot.
+                if self._wait_for_load_takeover(slot, pid):
+                    logger.info(
+                        f"Worker slot {slot} recovered with a new process (pid {pid}), "
+                        "it has now taken over its share of the load."
+                    )
+                    return
+                slot_state["pid"] = None
+                slot_state["consecutive_failures"] += 1
+        finally:
+            slot_state["recovering"] = False
+
+    def _process_exited(self, pid: int) -> bool:
+        try:
+            reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        return reaped_pid != 0
+
+    def _wait_for_load_takeover(self, slot: int, pid: int) -> bool:
+        """
+        Wait until the replacement actually takes over load, tracking its liveness.
+
+        Dead worker processes keep their booked users on the master until it declares
+        them missing, so a rebalance triggered before that would assign nothing to the
+        replacement. Wait until all earlier clients of the same slot are missing (and
+        thus removed from the dispatcher), trigger one rebalance, then keep watching the
+        replacement briefly in case it crashes right as it receives the load.
+
+        Returns False (one more consecutive failure) if the replacement died.
+        """
+        assert self.runner is not None
+        slot_state = self.slots[slot]
+        current_client_id = slot_state["client_id"]
+        marker = f"_slot{slot}_"
+        deadline = time.time() + WORKER_RESTART_HANDSHAKE_TIMEOUT
+        stale_cleared = False
+        while not self.stopped and time.time() < deadline:
+            if self._process_exited(pid):
+                return False
+            stale_clients_alive = [
+                client
+                for client in self.runner.clients.all
+                if client.state != STATE_MISSING and marker in client.id and client.id != current_client_id
+            ]
+            if not stale_clients_alive:
+                stale_cleared = True
+                break
+            gevent.sleep(0.2)
+
+        if not stale_cleared or self.stopped or self._process_exited(pid):
+            return False
+        gevent.sleep(0.2)
+        if self._process_exited(pid):
+            return False
+        if self.runner.state in (STATE_SPAWNING, STATE_RUNNING):
+            self.runner.start(self.runner.target_user_count, self.runner.spawn_rate)
+
+        # guard period: a replacement that dies right as load is assigned still counts
+        # as the same consecutive failure chain
+        guard_deadline = time.time() + WORKER_KILL_GRACE_PERIOD
+        while not self.stopped and time.time() < guard_deadline:
+            if self._process_exited(pid):
+                return False
+            gevent.sleep(0.2)
+        return not self.stopped
+
+    def _start_worker_process(self, slot: int) -> int:
+        """Start a fresh worker process for the given slot (fork+exec, clean state)."""
+        worker_env = {**os.environ, "LOCUST_WORKER_SLOT": str(slot)}
+        command = [
+            sys.executable,
+            "-m",
+            "locust",
+            "--headless",
+            "--worker",
+            "-f",
+            "-",
+            "--master-host",
+            self.master_host,
+            "--master-port",
+            str(self.master_port),
+        ]
+        process = subprocess.Popen(
+            command,
+            env=worker_env,
+            stdin=subprocess.DEVNULL,
+        )
+        return process.pid
+
+    def _wait_for_handshake(self, slot: int, pid: int, known_client_ids: set[str]) -> bool:
+        slot_state = self.slots[slot]
+        deadline = time.time() + WORKER_RESTART_HANDSHAKE_TIMEOUT
+        marker = f"_slot{slot}_"
+        while time.time() < deadline and not self.stopped:
+            try:
+                reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return False
+            if reaped_pid != 0:
+                # process died before completing the handshake
+                return False
+            assert self.runner is not None
+            for client in self.runner.clients.all:
+                if client.state == STATE_MISSING:
+                    continue
+                if marker in client.id and client.id not in known_client_ids:
+                    slot_state["client_id"] = client.id
+                    slot_state["handshaken_at"] = time.time()
+                    return True
+            gevent.sleep(0.2)
+        return False
+
+    def _kill_pid(self, pid: int) -> None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    def _abort(self, slot: int) -> None:
+        if self.aborted:
+            return
+        self.aborted = True
+        self.stopped = True
+        failures = self.slots[slot]["consecutive_failures"]
+        logger.error(
+            f"Worker slot {slot} has failed {failures} times in a row, exceeding the budget of "
+            f"{self.max_attempts}. Giving up recovery and shutting down Locust."
+        )
+        if self.runner is not None:
+            try:
+                self.runner.quit()
+            except Exception:
+                logger.error(f"Error while stopping master during abort: {traceback.format_exc()}")
+        gevent.sleep(1.0)
+        self.kill_all_workers()
+        logger.info("All worker processes terminated; exiting after unrecoverable worker failure.")
+        # exit immediately from this greenlet without leaving any recovery/worker behind
+        os._exit(1)
+
+    def kill_all_workers(self) -> None:
+        """Signal all worker processes, wait briefly and SIGKILL anyone still alive."""
+        # First wait without signalling for processes that are already exiting on their
+        # own (e.g. they hit the same startup error as the parent), so we don't interrupt
+        # them halfway through logging it
+        pids = self.live_pids
+        quiet_deadline = time.time() + WORKER_KILL_GRACE_PERIOD
+        remaining = list(pids)
+        while remaining and time.time() < quiet_deadline:
+            for pid in remaining[:]:
+                if self._process_exited(pid):
+                    remaining.remove(pid)
+            if remaining:
+                gevent.sleep(0.1)
+
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+        deadline = time.time() + WORKER_KILL_GRACE_PERIOD
+        for pid in remaining:
+            while True:
+                if self._process_exited(pid):
+                    break
+                if time.time() > deadline:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    self._process_exited(pid)
+                    break
+                gevent.sleep(0.1)
 
 
 def create_environment(
@@ -187,7 +517,7 @@ def main():
             start_message += ", OpenTelemetry enabled"
 
     children = []
-    logger = logging.getLogger(__name__)
+    worker_pool: LocalWorkerPool | None = None
 
     logger.info(start_message)
 
@@ -212,7 +542,8 @@ def main():
         gc.collect()  # avoid freezing garbage
         if hasattr(gc, "freeze"):
             gc.freeze()  # move all objects to perm gen so ref counts dont get updated
-        for _ in range(options.processes):
+        for slot in range(options.processes):
+            os.environ["LOCUST_WORKER_SLOT"] = str(slot)
             if child_pid := gevent.fork():
                 children.append(child_pid)
                 logging.debug(f"Started child worker with pid #{child_pid}")
@@ -229,6 +560,7 @@ def main():
                 break
         else:
             # we're in the parent process
+            os.environ.pop("LOCUST_WORKER_SLOT", None)
             if options.worker:
                 # ignore the first sigint in parent, and wait for the children to handle sigint
                 def sigint_handler(_signal, _frame):
@@ -256,42 +588,8 @@ def main():
             else:
                 options.master = True
                 options.expect_workers = options.processes
-
-                def kill_workers(children):
-                    exit_code = 0
-                    start_time = time.time()
-                    # give children some time to finish up (in case they had an error parsing arguments etc)
-                    for child_pid in children[:]:
-                        while time.time() < start_time + 3:
-                            try:
-                                _, child_status = os.waitpid(child_pid, os.WNOHANG)
-                                children.remove(child_pid)
-                                child_exit_code = os.waitstatus_to_exitcode(child_status)
-                                exit_code = max(exit_code, child_exit_code)
-                            except OSError as e:
-                                if e.errno == errno.EINTR:
-                                    time.sleep(0.1)
-                                else:
-                                    logging.error(traceback.format_exc())
-                            else:
-                                break
-                    for child_pid in children:
-                        try:
-                            logging.debug(f"Sending SIGINT to child with pid {child_pid}")
-                            os.kill(child_pid, signal.SIGINT)
-                        except ProcessLookupError:
-                            pass  # never mind, process was already dead
-                    for child_pid in children:
-                        _, child_status = os.waitpid(child_pid, 0)
-                        child_exit_code = os.waitstatus_to_exitcode(child_status)
-                        exit_code = max(exit_code, child_exit_code)
-                    if exit_code > 1:
-                        logging.error(f"Bad response code from worker children: {exit_code}")
-                    # ensure master doesn't finish until output from workers has arrived
-                    # otherwise the terminal might look weird.
-                    time.sleep(0.1)
-
-                atexit.register(kill_workers, children)
+                worker_pool = LocalWorkerPool({slot: pid for slot, pid in enumerate(children)})
+                atexit.register(worker_pool.kill_all_workers)
 
     greenlet_exception_handler = greenlet_exception_logger(logger)
 
@@ -408,6 +706,17 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
             master_bind_host=options.master_bind_host,
             master_bind_port=options.master_bind_port,
         )
+        if worker_pool is not None:
+            # built-in --processes mode: supervise and replenish worker slots
+            worker_pool.attach(
+                runner,
+                master_host=options.master_host,
+                master_port=options.master_port,
+                max_attempts=options.worker_restart_attempts,
+                restart_delay=options.worker_restart_delay,
+            )
+            environment.events.quitting.add_listener(worker_pool.stop)
+            gevent.spawn(worker_pool.supervise).link_exception(greenlet_exception_handler)
     elif options.worker:
         try:
             runner = environment.create_worker_runner(options.master_host, options.master_port)

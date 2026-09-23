@@ -698,6 +698,22 @@ Typically ONLY these options (and --locustfile) need to be specified on workers,
         env_var="LOCUST_PROCESSES",
     )
     worker_group.add_argument(
+        "--worker-restart-attempts",
+        type=positive_integer,
+        metavar="<int>",
+        default=3,
+        help="How many times Locust will try to replace a worker process that exits unexpectedly during a test run when using --processes. If the worker slot fails this many times in a row the test is aborted. Defaults to 3.",
+        env_var="LOCUST_WORKER_RESTART_ATTEMPTS",
+    )
+    worker_group.add_argument(
+        "--worker-restart-delay",
+        type=float,
+        metavar="<seconds>",
+        default=1.0,
+        help="Delay in seconds between attempts to restart a worker process that exited unexpectedly when using --processes. Defaults to 1.",
+        env_var="LOCUST_WORKER_RESTART_DELAY",
+    )
+    worker_group.add_argument(
         "--slave",
         action=raise_argument_type_error("The --slave parameter has been renamed --worker"),
         nargs=0,

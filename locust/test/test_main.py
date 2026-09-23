@@ -1669,6 +1669,114 @@ class AnyUser(User):
                     tp_master.expect("Shutting down")
                     tp_master.not_expect_any("Traceback")
 
+    @unittest.skipIf(IS_WINDOWS, reason="--processes doesnt work on windows")
+    def test_processes_worker_is_restarted_after_crash(self):
+        self.timeout.cancel()
+        self.timeout = gevent.Timeout(60)
+        self.timeout.start()
+        marker_file = os.path.join(
+            tempfile.gettempdir(), f"locust_worker_restart_marker_{os.getpid()}.flag"
+        )
+        if os.path.exists(marker_file):
+            os.remove(marker_file)
+        # the slot 0 worker dies the first time a test starts (creating a marker),
+        # replacement processes download the locustfile from master and see the marker
+        content = f"""
+from locust import runners, events, User, task
+import os, sys
+
+if os.path.exists({marker_file!r}):
+    print("REPLACEMENT WORKER ALIVE")
+
+@events.test_start.add_listener
+def on_test_start(environment, **_kwargs):
+    if isinstance(environment.runner, runners.WorkerRunner) and os.environ.get("LOCUST_WORKER_SLOT") == "0":
+        if not os.path.exists({marker_file!r}):
+            with open({marker_file!r}, "w") as f:
+                f.write("1")
+            sys.exit(42)
+
+class AnyUser(User):
+    @task
+    def mytask(self):
+        pass
+"""
+        try:
+            with mock_locustfile(content=content) as mocked:
+                with TestProcess(
+                    f"locust -f {mocked.file_path} --processes 3 --headless -u 6 -r 10 "
+                    f"--worker-restart-delay 0.2 --exit-code-on-error 0",
+                    expect_timeout=30,
+                    join_timeout=5,
+                ) as tp:
+                    tp.expect("Restarting worker in slot 0 (attempt 1 of 3)")
+                    tp.expect("REPLACEMENT WORKER ALIVE", stream="stdout")
+                    tp.expect("slot0")
+                    tp.expect("All users spawned")
+                    tp.terminate()
+                    tp.expect("The last worker quit, stopping test")
+                    tp.not_expect_any("Traceback")
+        finally:
+            if os.path.exists(marker_file):
+                os.remove(marker_file)
+
+    @unittest.skipIf(IS_WINDOWS, reason="--processes doesnt work on windows")
+    def test_processes_worker_restart_aborts_after_consecutive_failures(self):
+        self.timeout.cancel()
+        self.timeout = gevent.Timeout(60)
+        self.timeout.start()
+        # every process filling slot 0 dies as soon as the test starts, forever
+        content = """
+from locust import runners, events, User, task
+import os, sys
+
+@events.test_start.add_listener
+def on_test_start(environment, **_kwargs):
+    if isinstance(environment.runner, runners.WorkerRunner) and os.environ.get("LOCUST_WORKER_SLOT") == "0":
+        sys.exit(42)
+
+class AnyUser(User):
+    @task
+    def mytask(self):
+        pass
+"""
+        seen_worker_pids: set[int] = set()
+
+        def collect_worker_pids(tp: TestProcess):
+            while True:
+                try:
+                    parent = psutil.Process(tp.proc.pid)
+                    for child in parent.children(recursive=True):
+                        seen_worker_pids.add(child.pid)
+                except psutil.NoSuchProcess:
+                    return
+                gevent.sleep(0.1)
+
+        with mock_locustfile(content=content) as mocked:
+            tp = TestProcess(
+                f"locust -f {mocked.file_path} --processes 3 --headless -u 9 -r 10 "
+                f"--worker-restart-attempts 2 --worker-restart-delay 0.1",
+                sigint_on_exit=False,
+                expect_return_code=1,
+                expect_timeout=30,
+                join_timeout=30,
+            )
+            with tp:
+                collector = gevent.spawn(collect_worker_pids, tp)
+                # the initial spawn wave reaches all 3 workers before slot 0 keeps crashing
+                tp.expect("Sending spawn jobs of 9 users")
+                tp.expect("Restarting worker in slot 0 (attempt 1 of 2)")
+                tp.expect("Restarting worker in slot 0 (attempt 2 of 2)")
+                tp.expect("Giving up recovery and shutting down Locust")
+                collector.join(timeout=5)
+
+        # no worker process may be left behind
+        leftover = [psutil.Process(pid) for pid in seen_worker_pids if psutil.pid_exists(pid)]
+        gone, alive = psutil.wait_procs(leftover, timeout=2)
+        for p in alive:
+            p.kill()
+        self.assertEqual(len(alive), 0, "worker processes were left behind after abort")
+
 
 class TelemetryTests(ProcessIntegrationTest):
     def test_otel_flag(self):

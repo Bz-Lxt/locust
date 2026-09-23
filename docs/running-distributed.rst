@@ -31,6 +31,8 @@ You can even auto-detect the number of logical cores in your machine and launch 
 
     locust --processes -1
 
+If a worker process exits unexpectedly during a test run, its worker slot is automatically replaced with a new process. The new worker connects and completes its handshake before taking on its share of the load, so the test keeps running at full capacity. The number of consecutive restart attempts per worker slot can be configured with ``--worker-restart-attempts`` (defaults to 3) and the delay between attempts with ``--worker-restart-delay`` (defaults to 1 second). If a slot cannot be recovered within the budget, Locust stops recovery, shuts down the test and terminates all worker processes, so no processes are left behind.
+
 Multiple machines
 =================
 

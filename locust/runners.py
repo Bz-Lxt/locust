@@ -1238,8 +1238,16 @@ class WorkerRunner(DistributedRunner):
         self.connected = False
         self.last_heartbeat_timestamp: float | None = None
         self.connection_event = Event()
+        # Set at the end of __init__, so that a spawn message that arrives while this runner
+        # is still being constructed is only processed once environment.runner is assigned
+        self.init_complete = Event()
         self.worker_state = STATE_INIT
-        self.client_id = socket.gethostname() + "_" + uuid4().hex
+        # LOCUST_WORKER_SLOT is set when the worker was spawned by --processes mode and identifies
+        # which worker slot (0-based) the process fills, so the parent can correlate restarts/handshakes
+        worker_slot = os.environ.get("LOCUST_WORKER_SLOT", "")
+        self.client_id = (
+            socket.gethostname() + (f"_slot{worker_slot}" if worker_slot else "") + "_" + uuid4().hex
+        )
         self.master_host = master_host
         self.master_port = master_port
         self.web_base_path = environment.parsed_options.web_base_path if environment.parsed_options else ""
@@ -1273,6 +1281,9 @@ class WorkerRunner(DistributedRunner):
             self.client.send(Message("exception", {"msg": str(exception), "traceback": formatted_tb}, self.client_id))
 
         self.environment.events.user_error.add_listener(on_user_error)
+
+        # spawn messages queued before this point can now be handled with environment.runner set
+        self.init_complete.set()
 
     def spawning_complete(self, user_count):
         assert user_count == sum(self.user_classes_count.values())
@@ -1372,6 +1383,8 @@ class WorkerRunner(DistributedRunner):
                     self.worker_index = msg.data["index"]
                 self.connection_event.set()
             case "spawn":
+                # don't act on a spawn that arrived while this runner was still being built
+                self.init_complete.wait()
                 self.client.send(Message("spawning", None, self.client_id))
                 job = msg.data
                 if job["timestamp"] <= self.last_received_spawn_timestamp:
