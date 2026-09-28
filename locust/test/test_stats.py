@@ -11,6 +11,7 @@ from locust.stats import (
     StatsCSVFileWriter,
     StatsEntry,
     StatsError,
+    WindowRegistry,
     bucket_response_time,
     diff_response_time_dicts,
     setup_distributed_stats_event_listeners,
@@ -24,6 +25,7 @@ import csv
 import json
 import os
 import re
+import tempfile
 import time
 import unittest
 from io import StringIO
@@ -436,6 +438,210 @@ class TestRequestStats(unittest.TestCase):
         self.assertEqual(20, u1.median_response_time)
 
 
+class TestWindowRegistry(unittest.TestCase):
+    def test_initial_window_starts_at_epoch_zero(self):
+        environment = Environment()
+        registry = WindowRegistry(environment, grace_period=10)
+
+        self.assertEqual(0, registry.current_epoch)
+        self.assertIs(environment.stats, registry.current_window.stats)
+        self.assertIsNone(registry.current_window.close_time)
+        self.assertFalse(registry.current_window.is_closed)
+
+    def test_cut_advances_epoch_and_creates_empty_window(self):
+        environment = Environment()
+        registry = WindowRegistry(environment, grace_period=10)
+
+        environment.stats.log_request("GET", "old_entry", 100, 10)
+        old_stats = environment.stats
+
+        t1 = 1000.0
+        window1 = registry.cut(timestamp=t1)
+
+        self.assertEqual(1, registry.current_epoch)
+        self.assertEqual(1, window1.epoch)
+        self.assertIsNot(environment.stats, old_stats)
+        self.assertIs(environment.stats, window1.stats)
+        self.assertEqual(0, environment.stats.total.num_requests)
+        # old window was closed
+        closed_window = registry.get_window(0)
+        assert closed_window is not None
+        self.assertEqual(t1, closed_window.close_time)
+        self.assertEqual(t1 + 10, closed_window.grace_deadline)
+        self.assertTrue(closed_window.is_closed)
+        self.assertIs(closed_window.stats, old_stats)
+
+        # cut a second time
+        t2 = 2000.0
+        registry.cut(timestamp=t2, grace_period=5)
+        self.assertEqual(2, registry.current_epoch)
+        self.assertEqual(0, environment.stats.total.num_requests)
+        self.assertEqual(t2, registry.get_window(1).close_time)
+        self.assertEqual(t2 + 5, registry.get_window(1).grace_deadline)
+
+    def test_close_listener_fired_with_closed_window(self):
+        environment = Environment()
+        registry = WindowRegistry(environment, grace_period=10)
+        closed = []
+        registry.add_close_listener(closed.append)
+
+        registry.cut(timestamp=1234.0)
+
+        self.assertEqual(1, len(closed))
+        self.assertEqual(0, closed[0].epoch)
+        self.assertEqual(1234.0, closed[0].close_time)
+
+    def test_reset_drops_all_windows_and_restarts_epoch(self):
+        environment = Environment()
+        registry = WindowRegistry(environment, grace_period=10)
+        registry.cut()
+        registry.cut()
+
+        registry.reset()
+
+        self.assertEqual(0, registry.current_epoch)
+        self.assertIsNone(registry.get_window(1))
+        self.assertIsNone(registry.get_window(2))
+        self.assertEqual(0, environment.stats.total.num_requests)
+        self.assertIs(environment.stats, registry.current_window.stats)
+
+    def test_finalize_releases_aggregate_keeps_metadata(self):
+        environment = Environment()
+        registry = WindowRegistry(environment, grace_period=10)
+        registry.cut()
+
+        registry.finalize(0, final_total={"num_requests": 7})
+
+        window0 = registry.get_window(0)
+        self.assertIsNotNone(window0)
+        self.assertTrue(window0.is_finalized)
+        self.assertIsNone(registry.get_window_stats(0))
+        self.assertEqual({"num_requests": 7}, window0.final_total)
+
+    def test_local_runner_reset_stats_cuts_window(self):
+        environment = Environment(user_classes=[])
+        runner = environment.create_local_runner()
+        try:
+            environment.stats.log_request("GET", "old_entry", 100, 10)
+            old_stats = environment.stats
+
+            runner.reset_stats()
+
+            self.assertEqual(1, runner.window_registry.current_epoch)
+            self.assertIsNot(environment.stats, old_stats)
+            self.assertEqual(0, environment.stats.total.num_requests)
+            # old window retrievable by epoch
+            old_window = runner.window_registry.get_window(0)
+            self.assertIsNotNone(old_window)
+            self.assertIs(old_window.stats, old_stats)
+        finally:
+            runner.quit()
+
+    def test_window_aggregate_finalized_and_released_after_grace_period(self):
+        from gevent import sleep
+
+        environment = Environment(user_classes=[])
+        runner = environment.create_local_runner()
+        try:
+            runner.window_registry.grace_period = 0.2
+            environment.stats.log_request("GET", "old_entry", 100, 10)
+
+            boundary = time.time()
+            runner.reset_stats()
+            # new window gets data while the old one is still within grace
+            environment.stats.log_request("GET", "new_entry", 200, 20)
+
+            window0 = runner.window_registry.get_window(0)
+            self.assertIsNotNone(window0.stats)
+            sleep(0.5)
+
+            # heavy aggregate released, bounded metadata + final totals kept
+            self.assertTrue(window0.is_finalized)
+            self.assertIsNone(window0.stats)
+            self.assertEqual(1, window0.final_total["num_requests"])
+            self.assertIsNotNone(window0.close_time)
+            self.assertGreaterEqual(window0.close_time, boundary - 0.1)
+            # current window untouched
+            self.assertEqual(1, environment.stats.total.num_requests)
+        finally:
+            runner.quit()
+
+    def test_finalization_emits_boundary_and_final_snapshot_rows(self):
+        from gevent import sleep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            environment = Environment(user_classes=[])
+            runner = environment.create_local_runner()
+            try:
+                runner.window_registry.grace_period = 0.2
+                environment.stats.log_request("GET", "old_entry", 100, 10)
+                stats_writer = StatsCSVFileWriter(
+                    environment, PERCENTILES_TO_REPORT, os.path.join(tmpdir, "test"), full_history=True
+                )
+                stats_writer.greenlet = gevent.spawn(stats_writer.stats_writer)
+
+                runner.reset_stats()
+                sleep(0.5)
+
+                stats_writer.close_files()
+                with open(os.path.join(tmpdir, "test_stats_history.csv")) as f:
+                    rows = list(csv.DictReader(f))
+
+                boundary_rows = [r for r in rows if r["Type"] == "WINDOW_BOUNDARY"]
+                self.assertEqual(1, len(boundary_rows))
+                self.assertEqual("0", boundary_rows[0]["Window"])
+                # final snapshot rows carry the closed epoch and the old request only
+                final_rows = [r for r in rows if r["Window"] == "0" and r["Type"] != "WINDOW_BOUNDARY"]
+                self.assertEqual({"old_entry", "Aggregated"}, {r["Name"] for r in final_rows})
+            finally:
+                runner.quit()
+
+    def test_finalization_waiter_from_previous_generation_is_harmless(self):
+        from gevent import sleep
+
+        environment = Environment(user_classes=[])
+        runner = environment.create_local_runner()
+        try:
+            runner.window_registry.grace_period = 0.3
+            runner.reset_stats()  # arms a waiter for window 0, generation 0
+            # a new test resets before grace ends: window 0 recycled, generation bumped
+            runner.window_registry.reset()
+            environment.stats.log_request("GET", "new_test_entry", 100, 10)
+
+            sleep(0.6)
+
+            window0 = runner.window_registry.get_window(0)
+            # the stale waiter must not have finalized the recycled window 0
+            self.assertIs(window0.stats, environment.stats)
+            self.assertFalse(window0.is_closed)
+            self.assertEqual(1, environment.stats.total.num_requests)
+        finally:
+            runner.quit()
+
+    def test_repeated_resets_leave_bounded_number_of_live_aggregates(self):
+        from gevent import sleep
+
+        environment = Environment(user_classes=[])
+        runner = environment.create_local_runner()
+        try:
+            runner.window_registry.grace_period = 0.1
+            for i in range(4):
+                environment.stats.log_request("GET", f"entry_{i}", 100, 10)
+                runner.reset_stats()
+                sleep(0.25)
+
+            live_aggregates = [
+                window for window in runner.window_registry.windows.values() if window.stats is not None
+            ]
+            # every closed window is finalized; only the current one retains data
+            self.assertEqual(1, len(live_aggregates))
+            self.assertEqual(runner.window_registry.current_epoch, live_aggregates[0].epoch)
+            finalized = [w for w in runner.window_registry.windows.values() if w.is_finalized]
+            self.assertEqual(4, len(finalized))
+        finally:
+            runner.quit()
+
+
 class TestStatsPrinting(LocustTestCase):
     def setUp(self):
         super().setUp()
@@ -724,6 +930,71 @@ class TestCsvStats(LocustTestCase):
         gevent.kill(greenlet2)
         self.assertEqual(1, len(hs1))
         self.assertEqual(0, len(hs2))
+
+    @mock.patch("locust.stats.CSV_STATS_INTERVAL_SEC", new=_TEST_CSV_STATS_INTERVAL_SEC)
+    def test_stats_history_window_column_boundary_rows_and_isolation(self):
+        environment = Environment()
+        stats_writer = StatsCSVFileWriter(
+            environment, PERCENTILES_TO_REPORT, self.STATS_BASE_NAME, full_history=True
+        )
+        runner = environment.create_local_runner()
+        greenlet = gevent.spawn(stats_writer)
+        gevent.sleep(_TEST_CSV_STATS_INTERVAL_WAIT_SEC)
+
+        # window 0: 2 requests on /w0
+        for _ in range(2):
+            runner.stats.log_request("GET", "/w0", 100, 10)
+        gevent.sleep(_TEST_CSV_STATS_INTERVAL_WAIT_SEC)
+
+        # reset to window 1 (+ explicit boundary row)
+        runner.reset_stats()
+        stats_writer.write_window_boundary_row(0, 1, time.time())
+        for _ in range(3):
+            runner.stats.log_request("GET", "/w1", 100, 10)
+        gevent.sleep(_TEST_CSV_STATS_INTERVAL_WAIT_SEC)
+
+        # reset to window 2
+        runner.reset_stats()
+        stats_writer.write_window_boundary_row(1, 2, time.time())
+        for _ in range(4):
+            runner.stats.log_request("GET", "/w2", 100, 10)
+        gevent.sleep(_TEST_CSV_STATS_INTERVAL_WAIT_SEC)
+
+        gevent.kill(greenlet)
+        stats_writer.close_files()
+
+        with open(self.STATS_HISTORY_FILENAME) as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
+
+        self.assertEqual("Window", fieldnames[0])
+
+        boundary_rows = [r for r in rows if r["Type"] == "WINDOW_BOUNDARY"]
+        self.assertEqual(2, len(boundary_rows))
+        self.assertEqual(["0", "1"], [r["Window"] for r in boundary_rows])
+
+        # group non-boundary data rows by window
+        per_window: dict[str, list[dict]] = {"0": [], "1": [], "2": []}
+        for r in rows:
+            if r["Type"] != "WINDOW_BOUNDARY":
+                per_window[r["Window"]].append(r)
+
+        # each window counted its own requests from zero (no cumulative leakage)...
+        window0_counts = [int(r["Total Request Count"]) for r in per_window["0"] if r["Name"] == "Aggregated"]
+        window1_counts = [int(r["Total Request Count"]) for r in per_window["1"] if r["Name"] == "Aggregated"]
+        window2_counts = [int(r["Total Request Count"]) for r in per_window["2"] if r["Name"] == "Aggregated"]
+        self.assertEqual(2, max(window0_counts))
+        self.assertEqual(3, max(window1_counts))
+        self.assertEqual(4, max(window2_counts))
+
+        # ...and each window only saw its own endpoint
+        self.assertTrue(any(r["Name"] == "/w0" for r in per_window["0"]))
+        self.assertFalse(any(r["Name"] == "/w0" for r in per_window["1"] + per_window["2"]))
+        self.assertTrue(any(r["Name"] == "/w1" for r in per_window["1"]))
+        self.assertFalse(any(r["Name"] == "/w1" for r in per_window["0"] + per_window["2"]))
+        self.assertTrue(any(r["Name"] == "/w2" for r in per_window["2"]))
+        self.assertFalse(any(r["Name"] == "/w2" for r in per_window["0"] + per_window["1"]))
 
 
 class TestStatsEntryResponseTimesCache(unittest.TestCase):

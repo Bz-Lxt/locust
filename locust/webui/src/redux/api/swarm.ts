@@ -15,9 +15,9 @@ const baseQuery = (args: any, api: any, extraOptions: any) =>
   fetchBaseQuery(
     window.baseUrl
       ? {
-          baseUrl: window.baseUrl,
-          credentials: 'include',
-        }
+        baseUrl: window.baseUrl,
+        credentials: 'include',
+      }
       : undefined,
   )(args, api, extraOptions);
 
@@ -66,6 +66,17 @@ export const api = createApi({
     resetStats: builder.mutation<void, void>({
       query: () => ({ url: 'stats/reset' }),
       invalidatesTags: ['stats'],
+      async onQueryStarted(_arg, { dispatch, queryFulfilled }) {
+        try {
+          await queryFulfilled;
+          // lazy import avoids the circular dependency api -> ui.slice -> store -> api
+          const { uiActions } = await import('redux/slice/ui.slice');
+          // boundary marker: all chart series are cleared so only the new window accumulates
+          dispatch(uiActions.resetCharts(new Date().toISOString()));
+        } catch {
+          // reset failed; leave the existing charts untouched
+        }
+      },
     }),
     stopSwarm: builder.mutation<void, void>({
       query: () => ({ url: 'stop' }),

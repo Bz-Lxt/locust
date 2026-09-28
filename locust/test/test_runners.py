@@ -20,16 +20,20 @@ from locust.runners import (
     WorkerNode,
     WorkerRunner,
 )
-from locust.stats import RequestStats
+from locust.stats import RequestStats, StatsCSVFileWriter
 from locust.user import TaskSet, User, task
 
+import csv
 import json
 import logging
+import os
 import random
+import tempfile
 import time
 import unittest
 from collections import defaultdict, deque
 from operator import itemgetter
+from typing import Any
 from unittest import mock
 
 import gevent
@@ -2319,6 +2323,230 @@ class TestMasterRunner(LocustRunnerTestCase):
             self.assertEqual(3, len(master.clients))
             self.assertEqual(1, len(self.mocked_log.warning))
 
+    def test_worker_report_routed_to_its_epoch_window(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+
+            # emulate worker-side buffers (separate objects, not the master's windows)
+            worker_epoch0_buffer = RequestStats(use_response_times_cache=False)
+            worker_epoch0_buffer.log_request("GET", "/old", 100, 10)
+
+            master.reset_stats()  # cut to epoch 1 while the epoch-0 report is in flight
+
+            worker_epoch1_buffer = RequestStats(use_response_times_cache=False)
+            worker_epoch1_buffer.log_request("GET", "/new", 200, 10)
+
+            old_data: dict[str, Any] = {
+                "user_count": 1,
+                "user_classes_count": {},
+                "report_stats": worker_epoch0_buffer,
+            }
+            self.environment.events.report_to_master.fire(client_id="fake_client", data=old_data)
+            old_data["epoch"] = 0
+
+            new_data: dict[str, Any] = {
+                "user_count": 1,
+                "user_classes_count": {},
+                "report_stats": worker_epoch1_buffer,
+            }
+            self.environment.events.report_to_master.fire(client_id="fake_client", data=new_data)
+            new_data["epoch"] = 1
+
+            # the epoch-0 report was in flight and only arrives now, after the reset
+            server.mocked_send(Message("stats", old_data, "fake_client"))
+            server.mocked_send(Message("stats", new_data, "fake_client"))
+            sleep(0.1)
+
+            self.assertIsNotNone(master.window_registry)
+            window0 = master.window_registry.get_window_stats(0)
+            window1 = master.window_registry.get_window_stats(1)
+            self.assertIsNotNone(window0)
+            self.assertIsNotNone(window1)
+            assert window0 is not None and window1 is not None
+
+            self.assertEqual(1, window0.total.num_requests)
+            self.assertIn(("/old", "GET"), window0.entries)
+            self.assertNotIn(("/new", "GET"), window0.entries)
+
+            self.assertEqual(1, window1.total.num_requests)
+            self.assertIn(("/new", "GET"), window1.entries)
+            self.assertNotIn(("/old", "GET"), window1.entries)
+
+    def test_stale_worker_report_attributed_and_worker_resynced(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+
+            # the worker misses this boundary (offline during the reset)
+            master.reset_stats()
+            self.assertEqual(1, master.window_registry.current_epoch)
+
+            # worker comes back and still reports epoch 0
+            stale_buffer = RequestStats(use_response_times_cache=False)
+            stale_buffer.log_request("GET", "/old", 100, 10)
+            stale_data: dict[str, Any] = {
+                "user_count": 1,
+                "user_classes_count": {},
+                "report_stats": stale_buffer,
+            }
+            self.environment.events.report_to_master.fire(client_id="fake_client", data=stale_data)
+            stale_data["epoch"] = 0
+
+            server.mocked_send(Message("stats", stale_data, "fake_client"))
+            sleep(0.1)
+
+            # attributed to the old window; current window untouched
+            window0 = master.window_registry.get_window_stats(0)
+            window1 = master.window_registry.get_window_stats(1)
+            self.assertEqual(1, window0.total.num_requests)
+            self.assertIn(("/old", "GET"), window0.entries)
+            self.assertEqual(0, window1.total.num_requests)
+
+            # master re-delivered the current boundary to this single worker
+            resync_messages = server.get_messages("reset_stats")
+            # broadcasts from reset_stats() + resync: 1 broadcast (to the worker) + 1 targeted
+            self.assertEqual(2, len(resync_messages))
+            self.assertEqual(1, resync_messages[-1].data["epoch"])
+            self.assertEqual("fake_client", resync_messages[-1].node_id)
+
+            # worker reacts as the reset_stats handler would: subsequent report epoch 1
+            new_buffer = RequestStats(use_response_times_cache=False)
+            new_buffer.log_request("GET", "/new", 200, 10)
+            new_data: dict[str, Any] = {
+                "user_count": 1,
+                "user_classes_count": {},
+                "report_stats": new_buffer,
+            }
+            self.environment.events.report_to_master.fire(client_id="fake_client", data=new_data)
+            new_data["epoch"] = 1
+            server.mocked_send(Message("stats", new_data, "fake_client"))
+            sleep(0.1)
+
+            self.assertEqual(1, window0.total.num_requests)
+            self.assertEqual(1, window1.total.num_requests)
+            self.assertIn(("/new", "GET"), window1.entries)
+
+    def test_report_for_finalized_window_goes_to_late_channel_and_csv(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+
+            # epoch 0 had data, then two cuts happen and epoch 0 is eventually finalized
+            master.stats.log_request("GET", "/early", 100, 10)
+            master.reset_stats()
+            master.reset_stats()
+            master.window_registry.finalize(0)
+            self.assertIsNone(master.window_registry.get_window_stats(0))
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                stats_writer = StatsCSVFileWriter(
+                    master.environment, [0.5, 0.95], os.path.join(tmpdir, "test"), full_history=True
+                )
+
+                # a very late epoch-0 report arrives after finalization
+                late_buffer = RequestStats(use_response_times_cache=False)
+                late_buffer.log_request("GET", "/late", 300, 10)
+                late_data: dict[str, Any] = {
+                    "user_count": 1,
+                    "user_classes_count": {},
+                    "report_stats": late_buffer,
+                }
+                self.environment.events.report_to_master.fire(client_id="fake_client", data=late_data)
+                late_data["epoch"] = 0
+
+                # master must not raise and must not touch the current window
+                server.mocked_send(Message("stats", late_data, "fake_client"))
+                sleep(0.1)
+                self.assertEqual(1, len(master.late_stats_reports))
+                self.assertEqual(0, master.stats.total.num_requests)
+
+                # the CSV writer drains it as rows tagged with the original epoch
+                stats_writer.stats_history_csv_writer.writerow(stats_writer.stats_history_csv_columns)
+                stats_writer._drain_late_stats_reports()
+                stats_writer.close_files()
+
+                with open(os.path.join(tmpdir, "test_stats_history.csv")) as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+
+                late_rows = [r for r in rows if r["Name"] == "/late"]
+                self.assertTrue(late_rows)
+                self.assertTrue(all(r["Window"] == "0" for r in late_rows))
+
+    def test_legacy_report_without_epoch_does_not_trigger_resync(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            master.reset_stats()
+
+            legacy_buffer = RequestStats(use_response_times_cache=False)
+            legacy_buffer.log_request("GET", "/legacy", 100, 10)
+            legacy_data: dict[str, Any] = {
+                "user_count": 1,
+                "user_classes_count": {},
+                "report_stats": legacy_buffer,
+            }
+            self.environment.events.report_to_master.fire(client_id="fake_client", data=legacy_data)
+            # no epoch key: legacy worker; goes to current window by degradation
+
+            server.mocked_send(Message("stats", legacy_data, "fake_client"))
+            sleep(0.1)
+
+            # only the broadcast from reset_stats, no targeted resync
+            reset_messages = server.get_messages("reset_stats")
+            self.assertEqual(1, len(reset_messages))
+            self.assertEqual(1, master.stats.total.num_requests)
+
+    def test_worker_report_without_epoch_degrades_to_current_window(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+
+            # emulate a legacy worker buffer (no epoch concept)
+            legacy_buffer = RequestStats(use_response_times_cache=False)
+            legacy_buffer.log_request("GET", "/mixed", 100, 10)
+
+            custom_worker_report_clients = []
+
+            def custom_worker_report_listener(client_id: str, data: dict[str, Any]) -> None:
+                custom_worker_report_clients.append(client_id)
+
+            self.environment.events.worker_report.add_listener(custom_worker_report_listener)
+
+            data: dict[str, Any] = {"user_count": 1, "user_classes_count": {}, "report_stats": legacy_buffer}
+            self.environment.events.report_to_master.fire(client_id="fake_client", data=data)
+            # legacy worker: no epoch field in data
+
+            server.mocked_send(Message("stats", data, "fake_client"))
+            sleep(0.1)
+
+            # still routed to the current (epoch 0) window without an exception...
+            self.assertEqual(1, master.stats.total.num_requests)
+            self.assertIn(("/mixed", "GET"), master.stats.entries)
+            # ...and existing custom worker_report listeners still fire
+            self.assertEqual(["fake_client"], custom_worker_report_clients)
+
+    def test_reset_stats_broadcasts_epoch_to_all_workers(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
+            server.mocked_send(Message("client_ready", __version__, "fake_client2"))
+
+            master.reset_stats()
+            reset_messages = server.get_messages("reset_stats")
+            self.assertEqual(2, len(reset_messages))
+            self.assertEqual([1, 1], [m.data["epoch"] for m in reset_messages])
+            self.assertIn("timestamp", reset_messages[0].data)
+            self.assertIsNotNone(master.window_registry)
+            self.assertEqual(1, master.window_registry.current_epoch)
+
+            # a second reset broadcasts the next epoch
+            master.reset_stats()
+            second_round = server.get_messages("reset_stats")[2:]
+            self.assertEqual(2, len(second_round))
+            self.assertEqual([2, 2], [m.data["epoch"] for m in second_round])
+
     def test_worker_stats_report_median(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
@@ -4233,6 +4461,120 @@ class TestWorkerRunner(LocustTestCase):
             self.assertEqual(worker.client_id, message.data.get("worker_id"))
             worker.quit()
             logger.removeHandler(log_handler)
+
+    def test_failed_stats_send_retains_report_for_retry(self):
+        class FakeClient:
+            def __init__(self):
+                self.sent = []
+                self.fail_next_stats = False
+                self._recv_queue: Queue = Queue()
+
+            def send(self, message):
+                if message.type == "stats" and self.fail_next_stats:
+                    self.fail_next_stats = False
+                    raise RPCError("simulated send failure")
+                self.sent.append(message)
+                if message.type == "client_ready":
+                    self._recv_queue.put(Message("ack", {"index": 0}, "master"))
+
+            def recv(self):
+                return self._recv_queue.get()
+
+            def close(self):
+                pass
+
+        fake_client = FakeClient()
+        environment = Environment(events=locust.events, catch_exceptions=False)
+        with mock.patch("locust.rpc.rpc.Client", return_value=fake_client):
+            worker = environment.create_worker_runner("localhost", 5557)
+        # let the stats_reporter consume its immediate first cycle before the test starts
+        sleep(0.1)
+        fake_client.sent.clear()
+        try:
+            environment.stats.log_request("GET", "/test", 100, 10)
+            environment.stats.log_request("GET", "/test", 200, 10)
+            environment.stats.log_error("GET", "/test", Exception("boom"))
+
+            # first send fails: the serialized report must be retained
+            fake_client.fail_next_stats = True
+            worker._send_stats()
+
+            self.assertEqual(1, len(worker.pending_stats_reports))
+            retained = worker.pending_stats_reports[0]
+            self.assertEqual(0, retained["epoch"])
+            retained_total = retained["stats_total"]
+            self.assertEqual(2, retained_total["num_requests"])
+            self.assertEqual(1, retained_total["num_failures"])
+            # the active buffer is a fresh/empty object, so nothing was double-kept
+            self.assertEqual(0, environment.stats.total.num_requests)
+
+            # a new sample accumulates while the old report is pending
+            environment.stats.log_request("GET", "/test", 300, 10)
+
+            # retry: pending report delivered first, then the new buffer
+            worker._send_stats()
+            self.assertEqual(0, len(worker.pending_stats_reports))
+
+            stats_messages = [m for m in fake_client.sent if m.type == "stats"]
+            self.assertEqual(2, len(stats_messages))
+            self.assertEqual(2, stats_messages[0].data["stats_total"]["num_requests"])
+            self.assertEqual(1, stats_messages[1].data["stats_total"]["num_requests"])
+        finally:
+            worker.quit()
+
+    def test_stats_report_includes_epoch(self):
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            worker = self.get_runner(environment=Environment(), client=client)
+            # let the stats_reporter consume its immediate first cycle before the test starts
+            sleep(0.1)
+            client.outbox.clear()
+            try:
+                worker.environment.stats.log_request("GET", "/test", 100, 10)
+                worker._send_stats()
+                stats_messages = client.get_messages("stats")
+                self.assertEqual(1, len(stats_messages))
+                self.assertEqual(0, stats_messages[0].data["epoch"])
+            finally:
+                worker.quit()
+
+    def test_worker_reset_stats_cuts_boundary(self):
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            worker = self.get_runner(environment=Environment(), client=client)
+            env = worker.environment
+            # let the stats_reporter consume its immediate first cycle before the test starts
+            sleep(0.1)
+            try:
+                for _ in range(3):
+                    env.stats.log_request("GET", "/old", 100, 10)
+                client.outbox.clear()
+
+                client.mocked_send(Message("reset_stats", {"epoch": 1, "timestamp": 1234.0}, "dummy_client_id"))
+                sleep(0.05)
+
+                stats_messages = client.get_messages("stats")
+                self.assertEqual(1, len(stats_messages), "exactly one old-epoch final report")
+                final_report = stats_messages[0]
+                self.assertEqual(0, final_report.data["epoch"])
+                self.assertEqual(3, final_report.data["stats_total"]["num_requests"])
+                self.assertEqual(1, worker.current_epoch)
+                self.assertEqual(0, env.stats.total.num_requests)
+
+                # new samples accumulate under the new epoch
+                env.stats.log_request("GET", "/new", 100, 10)
+                env.stats.log_request("GET", "/new", 100, 10)
+                worker._send_stats()
+                new_report = client.get_messages("stats")[1]
+                self.assertEqual(1, new_report.data["epoch"])
+                self.assertEqual(2, new_report.data["stats_total"]["num_requests"])
+
+                # duplicate and stale reset messages must be idempotent
+                client.mocked_send(Message("reset_stats", {"epoch": 1, "timestamp": 1235.0}, "dummy_client_id"))
+                client.mocked_send(Message("reset_stats", {"epoch": 0, "timestamp": 1236.0}, "dummy_client_id"))
+                sleep(0.05)
+                self.assertEqual(2, len(client.get_messages("stats")))
+                self.assertEqual(1, worker.current_epoch)
+            finally:
+                worker.quit()
 
 
 class TestMessageSerializing(unittest.TestCase):

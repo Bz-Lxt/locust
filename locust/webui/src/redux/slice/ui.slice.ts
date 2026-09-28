@@ -80,6 +80,17 @@ const uiSlice = createSlice({
         },
       };
     },
+    resetCharts: (state, { payload }: PayloadAction<string>) => {
+      // empty every series; the boundary marker is the only carried-over element
+      const emptyCharts = Object.keys(state.charts as ICharts).reduce(
+        (result, key) => (key === 'markers' ? result : { ...result, [key]: [] }),
+        {} as ICharts,
+      );
+      return {
+        ...state,
+        charts: { ...emptyCharts, markers: [payload] },
+      };
+    },
   },
 });
 

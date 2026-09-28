@@ -375,8 +375,11 @@ class WebUI:
         def reset_stats() -> str:
             environment.events.reset_stats.fire()
             if environment.runner is not None:
-                environment.runner.stats.reset_all()
+                environment.runner.reset_stats()
                 environment.runner.exceptions = {}
+            # invalidate the cached /stats/requests response so the next fetch
+            # reflects the new window instead of a stale pre-reset snapshot
+            request_stats.clear_cache()
             return "ok"
 
         @app_blueprint.route("/stats/report")

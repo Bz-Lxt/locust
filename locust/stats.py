@@ -10,9 +10,10 @@ import sys
 import time
 from abc import abstractmethod
 from collections import OrderedDict, defaultdict, namedtuple
+from collections.abc import Callable
 from copy import copy
 from itertools import chain
-from typing import TYPE_CHECKING, Protocol, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, TypeVar, cast
 
 import gevent
 
@@ -21,9 +22,8 @@ from .util.date import format_utc_timestamp
 from .util.rounding import proper_round
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Iterable
     from types import FrameType
-    from typing import Any
 
     from .env import Environment
     from .event import Events
@@ -106,6 +106,13 @@ HISTORY_STATS_INTERVAL_SEC = 5
 """Default interval for how frequently CSV files are written if this option is configured."""
 CSV_STATS_INTERVAL_SEC = 1
 CSV_STATS_FLUSH_INTERVAL_SEC = 5
+
+"""
+Default grace period - in seconds - during which a closed stats window still
+accepts late/in-flight reports before it is finalized to the history export.
+Can be overridden with the LOCUST_STATS_WINDOW_GRACE_PERIOD environment variable.
+"""
+DEFAULT_STATS_WINDOW_GRACE_PERIOD = 60.0
 
 """
 Default window size/resolution - in seconds - when calculating the current
@@ -289,8 +296,157 @@ class RequestStats:
             e.get_stripped_report() for e in self.entries.values() if not (e.num_requests == 0 and e.num_failures == 0)
         ]
 
+    def snapshot_stats(self) -> list[StatsEntryDict]:
+        """Serialize non-empty entries without clearing them (a non-destructive snapshot)."""
+        return [e.serialize() for e in self.entries.values() if not (e.num_requests == 0 and e.num_failures == 0)]
+
     def serialize_errors(self) -> dict[str, StatsErrorDict]:
         return {k: e.serialize() for k, e in self.errors.items()}
+
+
+class StatsWindow:
+    """
+    A single statistics window (epoch).
+
+    Holds the RequestStats for one window, along with its epoch and lifecycle
+    timestamps. Once the window is finalized (grace period expired) the heavy
+    stats aggregate is released and only bounded metadata is kept.
+    """
+
+    def __init__(
+        self,
+        epoch: int,
+        use_response_times_cache: bool = True,
+        start_time: float | None = None,
+        stats: RequestStats | None = None,
+    ) -> None:
+        self.epoch = epoch
+        self.start_time: float = start_time if start_time is not None else time.time()
+        self.close_time: float | None = None
+        self.grace_deadline: float | None = None
+        self.stats: RequestStats | None = (
+            stats if stats is not None else RequestStats(use_response_times_cache=use_response_times_cache)
+        )
+        self.final_total: dict[str, Any] | None = None
+
+    @property
+    def is_closed(self) -> bool:
+        return self.close_time is not None
+
+    @property
+    def is_finalized(self) -> bool:
+        return self.stats is None
+
+
+class WindowRegistry:
+    """
+    Registry of stats windows for Local and Master runners.
+
+    ``environment.stats`` always references the current window's RequestStats,
+    so all current views (stats endpoints, tables, overwritten CSV files and
+    the HTML report) reflect the current window only.
+    """
+
+    def __init__(
+        self,
+        environment: Environment,
+        *,
+        use_response_times_cache: bool = True,
+        grace_period: float | None = None,
+    ) -> None:
+        self.environment = environment
+        self.use_response_times_cache = use_response_times_cache
+        self.grace_period = self._resolve_grace_period(grace_period)
+        self.windows: dict[int, StatsWindow] = {}
+        self.current_epoch = 0
+        # bumped on every reset() so finalization waiters from an earlier test
+        # can't finalize the recycled window 0 of a later test
+        self.generation = 0
+
+        # reuse the existing environment.stats for the first window, so listeners
+        # that were registered with that object keep working
+        self.windows[0] = StatsWindow(0, stats=environment.stats)
+        self._sync_environment_stats()
+
+        self._close_listeners: list[Callable[[StatsWindow], None]] = []
+
+    @staticmethod
+    def _resolve_grace_period(grace_period: float | None) -> float:
+        if grace_period is not None:
+            return grace_period
+        env_value = os.getenv("LOCUST_STATS_WINDOW_GRACE_PERIOD")
+        if env_value is not None:
+            return float(env_value)
+        return DEFAULT_STATS_WINDOW_GRACE_PERIOD
+
+    def _sync_environment_stats(self) -> None:
+        current_stats = self.windows[self.current_epoch].stats
+        assert current_stats is not None
+        self.environment.stats = current_stats
+
+    @property
+    def current_window(self) -> StatsWindow:
+        return self.windows[self.current_epoch]
+
+    def get_window(self, epoch: int) -> StatsWindow | None:
+        return self.windows.get(epoch)
+
+    def get_window_stats(self, epoch: int) -> RequestStats | None:
+        window = self.windows.get(epoch)
+        return window.stats if window is not None else None
+
+    def add_close_listener(self, listener: Callable[[StatsWindow], None]) -> None:
+        self._close_listeners.append(listener)
+
+    def cut(self, timestamp: float | None = None, grace_period: float | None = None) -> StatsWindow:
+        """
+        Close the current window and open a new empty one.
+
+        Returns the newly opened window.
+        """
+        now = timestamp if timestamp is not None else time.time()
+        old_window = self.current_window
+        old_window.close_time = now
+        period = grace_period if grace_period is not None else self.grace_period
+        old_window.grace_deadline = now + period if period > 0 else now
+
+        new_epoch = self.current_epoch + 1
+        new_window = StatsWindow(new_epoch, self.use_response_times_cache, start_time=now)
+        self.windows[new_epoch] = new_window
+        self.current_epoch = new_epoch
+        self._sync_environment_stats()
+
+        for listener in self._close_listeners:
+            listener(old_window)
+
+        return new_window
+
+    def reset(self) -> None:
+        """Drop all windows and restart from epoch 0 (a new test).
+
+        Reuses and clears the epoch-0 stats object in place whenever possible, so
+        listeners that hold a reference to it (master aggregation) stay valid.
+        """
+        window0 = self.windows.get(0)
+        if window0 is not None and window0.stats is not None:
+            window0.stats.clear_all()
+            window0.close_time = None
+            window0.grace_deadline = None
+            window0.final_total = None
+            self.windows = {0: window0}
+        else:
+            self.windows = {0: StatsWindow(0, stats=self.environment.stats)}
+        self.current_epoch = 0
+        self.generation += 1
+        self._sync_environment_stats()
+
+    def finalize(self, epoch: int, final_total: dict[str, Any] | None = None) -> None:
+        """Release the heavy aggregate of a closed window, keeping bounded metadata."""
+        window = self.windows.get(epoch)
+        if window is None or window.stats is None:
+            return
+        window.final_total = final_total
+        window.stats = None
 
 
 class StatsEntry:
@@ -815,37 +971,76 @@ def avg(values: list[float | int]) -> float:
     return sum(values, 0.0) / max(len(values), 1)
 
 
-def setup_distributed_stats_event_listeners(events: Events, stats: RequestStats) -> None:
+StatsRouter = Callable[[int | None], RequestStats | None]
+LateStatsSink = Callable[[int, dict[str, Any]], None]
+
+
+def aggregate_worker_report(stats: RequestStats, data: dict[str, Any]) -> None:
+    """
+    Merge one serialized worker report (entries, errors and total) into stats.
+
+    Shared by the live aggregation path and the late-report reconstruction so
+    there is a single merge implementation.
+    """
+    for stats_data in data["stats"]:
+        entry = StatsEntry.unserialize(stats_data, stats)
+        request_key = (entry.name, entry.method)
+        if request_key not in stats.entries:
+            stats.entries[request_key] = StatsEntry(stats, entry.name, entry.method, use_response_times_cache=True)
+        stats.entries[request_key].extend(entry)
+
+    for error_key, error in data["errors"].items():
+        if error_key not in stats.errors:
+            stats.errors[error_key] = StatsError.unserialize(error)
+        else:
+            existing = stats.errors[error_key]
+            existing.occurrences += error["occurrences"]
+            if incoming_first := error.get("first_seen"):
+                existing.first_seen = (
+                    incoming_first if existing.first_seen is None else min(existing.first_seen, incoming_first)
+                )
+            if incoming_last := error.get("last_seen"):
+                existing.last_seen = (
+                    incoming_last if existing.last_seen is None else max(existing.last_seen, incoming_last)
+                )
+
+    stats.total.extend(StatsEntry.unserialize(data["stats_total"], stats))
+
+
+def setup_distributed_stats_event_listeners(
+    events: Events,
+    stats: RequestStats,
+    stats_router: StatsRouter | None = None,
+    late_stats_sink: LateStatsSink | None = None,
+) -> None:
     def on_report_to_master(client_id: str, data: dict[str, Any]) -> None:
-        data["stats"] = stats.serialize_stats()
-        data["stats_total"] = stats.total.get_stripped_report()
-        data["errors"] = stats.serialize_errors()
-        stats.errors = {}
+        # The worker can provide the stats object it wants serialized (double
+        # buffering). If absent, fall back to the originally captured stats.
+        # Serialization is non-destructive; the worker swaps/clears buffers itself
+        # only after a successful send.
+        report_stats = data.pop("report_stats", stats)
+        data["stats"] = report_stats.snapshot_stats()
+        data["stats_total"] = report_stats.total.serialize()
+        data["errors"] = report_stats.serialize_errors()
 
     def on_worker_report(client_id: str, data: dict[str, Any]) -> None:
-        for stats_data in data["stats"]:
-            entry = StatsEntry.unserialize(stats_data, stats)
-            request_key = (entry.name, entry.method)
-            if request_key not in stats.entries:
-                stats.entries[request_key] = StatsEntry(stats, entry.name, entry.method, use_response_times_cache=True)
-            stats.entries[request_key].extend(entry)
-
-        for error_key, error in data["errors"].items():
-            if error_key not in stats.errors:
-                stats.errors[error_key] = StatsError.unserialize(error)
+        # Route the report to the window identified by its epoch. Without a router
+        # (e.g. workers serializing locally) everything goes to the captured stats.
+        if stats_router is not None:
+            report_stats = stats_router(data.get("epoch"))
+        else:
+            report_stats = stats
+        if report_stats is None:
+            # The target window is finalized or unknown: hand the raw report to
+            # the late-report channel instead of polluting the current window.
+            epoch = data.get("epoch")
+            if late_stats_sink is not None and epoch is not None:
+                logger.debug(f"Routing late stats report for epoch {epoch} to the history sink")
+                late_stats_sink(int(epoch), data)
             else:
-                existing = stats.errors[error_key]
-                existing.occurrences += error["occurrences"]
-                if incoming_first := error.get("first_seen"):
-                    existing.first_seen = (
-                        incoming_first if existing.first_seen is None else min(existing.first_seen, incoming_first)
-                    )
-                if incoming_last := error.get("last_seen"):
-                    existing.last_seen = (
-                        incoming_last if existing.last_seen is None else max(existing.last_seen, incoming_last)
-                    )
-
-        stats.total.extend(StatsEntry.unserialize(data["stats_total"], stats))
+                logger.warning(f"Dropping stats report for unknown epoch {epoch}")
+            return
+        aggregate_worker_report(report_stats, data)
 
     events.report_to_master.add_listener(on_report_to_master)
     events.worker_report.add_listener(on_worker_report)
@@ -1122,7 +1317,14 @@ class StatsCSVFileWriter(StatsCSV):
         self.exceptions_csv_writer = csv.writer(self.exceptions_csv_filehandle)
         self.exceptions_csv_data_start: int = 0
 
+        self._history_header_written = False
+        # attach to the runner so window finalization can emit boundary/final rows
+        runner = environment.runner
+        if runner is not None and getattr(runner, "window_registry", None) is not None:
+            runner._window_history_writer = self  # type: ignore[attr-defined]
+
         self.stats_history_csv_columns = [
+            "Window",
             "Timestamp",
             "User Count",
             "Type",
@@ -1149,7 +1351,7 @@ class StatsCSVFileWriter(StatsCSV):
         self.requests_csv_writer.writerow(self.requests_csv_columns)
         requests_csv_data_start = self.requests_csv_filehandle.tell()
 
-        self.stats_history_csv_writer.writerow(self.stats_history_csv_columns)
+        self._ensure_history_header()
 
         self.failures_csv_writer.writerow(self.failures_columns)
         self.failures_csv_data_start = self.failures_csv_filehandle.tell()
@@ -1168,6 +1370,7 @@ class StatsCSVFileWriter(StatsCSV):
                 self.requests_csv_filehandle.truncate()
 
                 self._stats_history_data_rows(self.stats_history_csv_writer, now)
+                self._drain_late_stats_reports()
 
                 self.failures_csv_filehandle.seek(self.failures_csv_data_start)
                 self._failures_data_rows(self.failures_csv_writer)
@@ -1199,33 +1402,125 @@ class StatsCSVFileWriter(StatsCSV):
 
         stats = self.environment.stats
         timestamp = int(now)
+        window_epoch = self._current_window_epoch()
+        user_count = self.environment.runner.user_count if self.environment.runner is not None else 0
         stats_entries: list[StatsEntry] = []
         if self.full_history:
             stats_entries = sort_stats(stats.entries)
 
         for stats_entry in chain(stats_entries, [stats.total]):
-            csv_writer.writerow(
-                chain(
-                    (
-                        timestamp,
-                        self.environment.runner.user_count if self.environment.runner is not None else 0,
-                        stats_entry.method or "",
-                        stats_entry.name,
-                        f"{stats_entry.current_rps:2f}",
-                        f"{stats_entry.current_fail_per_sec:2f}",
-                    ),
-                    self._percentile_fields(stats_entry, use_current=self.full_history),
-                    (
-                        stats_entry.num_requests,
-                        stats_entry.num_failures,
-                        stats_entry.median_response_time,
-                        stats_entry.avg_response_time,
-                        stats_entry.min_response_time or 0,
-                        stats_entry.max_response_time,
-                        stats_entry.avg_content_length,
-                    ),
-                )
+            self._write_stats_history_row(
+                csv_writer, window_epoch, timestamp, user_count, stats_entry
             )
+
+    def _ensure_history_header(self) -> None:
+        """Write the history header once, even if boundary/late rows arrive first."""
+        if not self._history_header_written:
+            self.stats_history_csv_writer.writerow(self.stats_history_csv_columns)
+            self._history_header_written = True
+
+    def _current_window_epoch(self) -> int:
+        registry = getattr(self.environment.runner, "window_registry", None)
+        if registry is not None:
+            return int(registry.current_epoch)
+        return 0
+
+    def _write_stats_history_row(
+        self,
+        csv_writer: CSVWriter,
+        window_epoch: int,
+        timestamp: int,
+        user_count: int,
+        stats_entry: StatsEntry,
+        use_current_percentiles: bool | None = None,
+    ) -> None:
+        if use_current_percentiles is None:
+            use_current_percentiles = self.full_history
+        csv_writer.writerow(
+            chain(
+                (
+                    window_epoch,
+                    timestamp,
+                    user_count,
+                    stats_entry.method or "",
+                    stats_entry.name,
+                    f"{stats_entry.current_rps:2f}",
+                    f"{stats_entry.current_fail_per_sec:2f}",
+                ),
+                self._percentile_fields(stats_entry, use_current=use_current_percentiles),
+                (
+                    stats_entry.num_requests,
+                    stats_entry.num_failures,
+                    stats_entry.median_response_time,
+                    stats_entry.avg_response_time,
+                    stats_entry.min_response_time or 0,
+                    stats_entry.max_response_time,
+                    stats_entry.avg_content_length,
+                ),
+            )
+        )
+
+    def write_window_boundary_row(self, closed_epoch: int, new_epoch: int, timestamp: float) -> None:
+        """Write a recognizable boundary row when a window is closed."""
+        self._ensure_history_header()
+        row: list[Any] = [""] * len(self.stats_history_csv_columns)
+        row[0] = closed_epoch
+        row[1] = int(timestamp)
+        row[3] = "WINDOW_BOUNDARY"
+        row[4] = f"Window {closed_epoch} closed; Window {new_epoch} opened"
+        self.stats_history_csv_writer.writerow(row)
+        self.stats_history_flush()
+
+    def write_window_final_snapshot_rows(self, window: StatsWindow) -> None:
+        """Append the final per-window snapshot rows just before the aggregate is released."""
+        if window.stats is None or window.close_time is None:
+            return
+        self._ensure_history_header()
+        timestamp = int(window.close_time)
+        user_count = self.environment.runner.user_count if self.environment.runner is not None else 0
+        stats_entries = sort_stats(window.stats.entries) if self.full_history else []
+        for stats_entry in chain(stats_entries, [window.stats.total]):
+            self._write_stats_history_row(
+                self.stats_history_csv_writer,
+                window.epoch,
+                timestamp,
+                user_count,
+                stats_entry,
+                use_current_percentiles=False,
+            )
+        self.stats_history_flush()
+
+    def _drain_late_stats_reports(self) -> None:
+        """Consume late reports queued by the master (duck-typed; absent elsewhere)."""
+        late_reports = getattr(self.environment.runner, "late_stats_reports", None)
+        if not late_reports:
+            return
+        while late_reports:
+            epoch, report = late_reports.pop(0)
+            self.write_late_stats_report(epoch, report)
+
+    def write_late_stats_report(self, epoch: int, data: dict[str, Any]) -> None:
+        """
+        Reconstruct a late report and append it marked with its original epoch,
+        without touching any finalized snapshot.
+        """
+        self._ensure_history_header()
+        late_stats = RequestStats(use_response_times_cache=False)
+        aggregate_worker_report(late_stats, data)
+
+        timestamp = int(time.time())
+        user_count = int(data.get("user_count", 0))
+        stats_entries = sort_stats(late_stats.entries) if self.full_history else []
+        for stats_entry in chain(stats_entries, [late_stats.total]):
+            self._write_stats_history_row(
+                self.stats_history_csv_writer,
+                epoch,
+                timestamp,
+                user_count,
+                stats_entry,
+                use_current_percentiles=False,
+            )
+        self.stats_history_flush()
 
     def requests_flush(self) -> None:
         self.requests_csv_filehandle.flush()

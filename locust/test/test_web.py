@@ -219,13 +219,45 @@ class TestWebUI(LocustTestCase, _HeaderCheckMixin):
 
         self.assertEqual(200, response.status_code)
 
-        self.assertEqual({}, self.stats.errors)
+        # reset cuts a new window, so environment.stats references a new RequestStats
+        current_stats = self.environment.stats
+        self.assertIsNot(current_stats, self.stats)
+
+        self.assertEqual({}, current_stats.errors)
         self.assertEqual({}, self.runner.exceptions)
 
-        self.assertEqual(0, self.stats.get("/", "GET").num_requests)
-        self.assertEqual(0, self.stats.get("/", "GET").num_failures)
-        self.assertEqual(0, self.stats.get("/test", "GET").num_requests)
-        self.assertEqual(0, self.stats.get("/test", "GET").num_failures)
+        self.assertEqual(0, current_stats.get("/", "GET").num_requests)
+        self.assertEqual(0, current_stats.get("/", "GET").num_failures)
+        self.assertEqual(0, current_stats.get("/test", "GET").num_requests)
+        self.assertEqual(0, current_stats.get("/test", "GET").num_failures)
+
+    def test_current_views_isolated_after_window_reset(self):
+        # populate the old window and warm the memoized /stats/requests cache
+        self.stats.log_request("GET", "/old", 100, 10)
+        self.stats.log_request("GET", "/old", 100, 10)
+        requests.get("http://127.0.0.1:%i/stats/requests" % self.web_port)
+
+        response = requests.get("http://127.0.0.1:%i/stats/reset" % self.web_port)
+        self.assertEqual(200, response.status_code)
+
+        # data in the new window only
+        self.environment.stats.log_request("GET", "/new", 200, 20)
+
+        data = json.loads(requests.get("http://127.0.0.1:%i/stats/requests" % self.web_port).text)
+        self.assertEqual(1, data["stats"][-1]["num_requests"])
+        self.assertEqual({"/new"}, {row["name"] for row in data["stats"][:-1]})
+
+        # overwritten CSV reflects the current window only
+        response = requests.get("http://127.0.0.1:%i/stats/requests/csv" % self.web_port)
+        self.assertEqual(200, response.status_code)
+        rows = list(csv.reader(StringIO(response.text)))
+        self.assertIn("1", rows[-1])
+        csv_text = response.text
+        self.assertIn("/new", csv_text)
+        self.assertNotIn("/old", csv_text)
+
+        # old window object still owns its own untouched totals
+        self.assertEqual(2, self.stats.total.num_requests)
 
     def test_exceptions(self):
         try:

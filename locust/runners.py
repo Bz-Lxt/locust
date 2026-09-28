@@ -31,13 +31,21 @@ from .dispatch import UsersDispatcher
 from .exception import RPCError, RPCReceiveError, RPCSendError, StopTest
 from .log import get_logs, greenlet_exception_logger
 from .rpc import Message, rpc
-from .stats import RequestStats, StatsError, setup_distributed_stats_event_listeners
+from .stats import (
+    LateStatsSink,
+    RequestStats,
+    StatsError,
+    StatsRouter,
+    WindowRegistry,
+    setup_distributed_stats_event_listeners,
+)
 from .util.directory import get_abspaths_in
 from .util.url import is_url
 
 if TYPE_CHECKING:
     from . import User
     from .env import Environment
+    from .stats import StatsWindow
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +127,10 @@ class Runner:
         # target_user_count is set before the ramp-up/ramp-down occurs.
         self.target_user_count: int = 0
         self.custom_messages: dict[str, tuple[Callable, bool]] = {}
+
+        # Local and Master runners set up a WindowRegistry. Worker runners don't
+        # aggregate windows, so this stays None on workers.
+        self.window_registry: WindowRegistry | None = None
 
         self._users_dispatcher: UsersDispatcher | None = None
 
@@ -202,6 +214,59 @@ class Runner:
         # Uncomment it if you are specifically debugging state transitions
         # logger.debug("Updating state to '%s', old state was '%s'" % (new_state, self.state))
         self.state = new_state
+
+    def reset_stats(self) -> None:
+        """
+        Reset statistics by cutting a new stats window.
+
+        Local and Master runners cut the WindowRegistry. Worker runners don't
+        aggregate windows and fall back to a local reset of their stats.
+        """
+        if self.window_registry is not None:
+            self.window_registry.cut()
+        else:
+            self.stats.reset_all()
+
+    def _arm_window_finalization(self, window: StatsWindow) -> None:
+        """Emit the boundary row immediately and schedule grace-period finalization."""
+        assert self.window_registry is not None
+        history_writer = getattr(self, "_window_history_writer", None)
+        if history_writer is not None and window.close_time is not None:
+            history_writer.write_window_boundary_row(window.epoch, window.epoch + 1, window.close_time)
+        generation = self.window_registry.generation
+        self.greenlet.spawn(self._finalize_window, window, generation)
+
+    def _finalize_window(self, window: StatsWindow, generation: int) -> None:
+        """
+        Wait until the window's grace deadline, persist boundary/final rows and
+        release the heavy aggregate.
+
+        Object identity plus the generation token make stale waiters (from a
+        previous test that was reset) harmless, even though window 0 is recycled.
+        """
+        assert self.window_registry is not None
+        if window.grace_deadline is not None and window.grace_deadline > time.time():
+            gevent.sleep(window.grace_deadline - time.time())
+
+        if (
+            generation != self.window_registry.generation
+            or self.window_registry.get_window(window.epoch) is not window
+        ):
+            return
+
+        self._write_window_final_snapshot_rows(window)
+
+        final_total = (
+            cast(dict[str, Any], window.stats.total.serialize()) if window.stats is not None else window.final_total
+        )
+        self.window_registry.finalize(window.epoch, final_total)
+
+    def _write_window_final_snapshot_rows(self, window: StatsWindow) -> None:
+        """Write the final snapshot rows via the history writer, if one is attached."""
+        history_writer = getattr(self, "_window_history_writer", None)
+        if history_writer is None:
+            return
+        history_writer.write_window_final_snapshot_rows(window)
 
     def cpu_log_warning(self) -> bool:
         """Called at the end of the test"""
@@ -452,6 +517,8 @@ class LocalRunner(Runner):
         self.worker_index = 0
         self.client_id = socket.gethostname() + "_" + uuid4().hex
         self.worker_count = 1
+        self.window_registry = WindowRegistry(environment)
+        self.window_registry.add_close_listener(self._arm_window_finalization)
         # Only when running in standalone mode (non-distributed)
         self._local_worker_node = WorkerNode(id="local")
         self._local_worker_node.user_classes_count = self.user_classes_count
@@ -478,7 +545,8 @@ class LocalRunner(Runner):
         self.target_user_count = user_count
 
         if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
-            self.stats.clear_all()
+            assert self.window_registry is not None
+            self.window_registry.reset()
             self.exceptions = {}
             self.cpu_warning_emitted = False
             self.worker_cpu_warning_emitted = False
@@ -584,7 +652,26 @@ class LocalRunner(Runner):
 class DistributedRunner(Runner):
     def __init__(self, environment) -> None:
         super().__init__(environment)
-        setup_distributed_stats_event_listeners(self.environment.events, self.stats)
+        # Routing indirection: MasterRunner installs the window router after its
+        # WindowRegistry exists; until then (and on workers) reports go to the
+        # originally captured stats object.
+        self._stats_router: StatsRouter | None = None
+        self._late_stats_sink: LateStatsSink | None = None
+        setup_distributed_stats_event_listeners(
+            self.environment.events,
+            self.stats,
+            stats_router=self._route_stats_report,
+            late_stats_sink=self._sink_late_stats_report,
+        )
+
+    def _route_stats_report(self, epoch: int | None) -> RequestStats | None:
+        if self._stats_router is None:
+            return self.stats
+        return self._stats_router(epoch)
+
+    def _sink_late_stats_report(self, epoch: int, data: dict[str, Any]) -> None:
+        if self._late_stats_sink is not None:
+            self._late_stats_sink(epoch, data)
 
 
 class WorkerNode:
@@ -672,6 +759,12 @@ class MasterRunner(DistributedRunner):
         self.worker_index_max = 0
 
         self.clients = WorkerNodes()
+        self.window_registry = WindowRegistry(environment)
+        self.window_registry.add_close_listener(self._arm_window_finalization)
+        # raw reports for finalized/unknown epochs; the history writer drains them
+        self.late_stats_reports: list[tuple[int, dict[str, Any]]] = []
+        self._stats_router = self._route_window_stats
+        self._late_stats_sink = self._accept_late_stats_report
         try:
             self.server = rpc.Server(master_bind_host, master_bind_port)
         except RPCError as e:
@@ -771,7 +864,8 @@ class MasterRunner(DistributedRunner):
             )
 
         if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
-            self.stats.clear_all()
+            assert self.window_registry is not None
+            self.window_registry.reset()
             self.exceptions = {}
             self.environment._filter_tasks_by_tags()
             self.environment.events.test_start.fire(environment=self.environment)
@@ -1135,6 +1229,7 @@ class MasterRunner(DistributedRunner):
                     logging.debug(f"Got heartbeat message from unknown worker {msg.node_id}")
             case "stats":
                 self.environment.events.worker_report.fire(client_id=msg.node_id, data=msg.data)
+                self._resync_worker_epoch_if_stale(msg.node_id, msg.data)
             case "spawning":
                 try:
                     self.clients[msg.node_id].state = STATE_SPAWNING
@@ -1197,6 +1292,55 @@ class MasterRunner(DistributedRunner):
                 reported_user_classes_count[name] += count
         return reported_user_classes_count
 
+    def _route_window_stats(self, epoch: int | None) -> RequestStats | None:
+        assert self.window_registry is not None
+        window = (
+            self.window_registry.current_window
+            if epoch is None
+            else self.window_registry.get_window(int(epoch))
+        )
+        if window is None or window.stats is None:
+            return None
+        return window.stats
+
+    def _accept_late_stats_report(self, epoch: int, data: dict[str, Any]) -> None:
+        self.late_stats_reports.append((epoch, data))
+
+    def _resync_worker_epoch_if_stale(self, client_id: str, data: dict[str, Any]) -> None:
+        """Re-deliver the current boundary to a worker that missed reset broadcasts."""
+        if client_id not in self.clients:
+            return
+        report_epoch = data.get("epoch")
+        # legacy workers (no epoch) keep their pre-window behavior, don't surprise them
+        if report_epoch is None:
+            return
+        assert self.window_registry is not None
+        current_epoch = self.window_registry.current_epoch
+        if int(report_epoch) >= current_epoch:
+            return
+        current_window = self.window_registry.current_window
+        logger.info(
+            f"Worker {client_id} reported stale epoch {report_epoch}; resyncing it to epoch {current_epoch}"
+        )
+        self.send_message(
+            "reset_stats",
+            {"epoch": current_epoch, "timestamp": current_window.start_time},
+            client_id=client_id,
+        )
+
+    def reset_stats(self) -> None:
+        """
+        Cut a new stats window and broadcast the boundary to all workers.
+
+        Workers flush their final old-epoch increments, clear their accumulators
+        and switch to the new epoch, so no in-flight increment leaks into the new
+        window.
+        """
+        assert self.window_registry is not None
+        boundary = time.time()
+        new_window = self.window_registry.cut(boundary)
+        self.send_message("reset_stats", {"epoch": new_window.epoch, "timestamp": boundary})
+
     def send_message(self, msg_type: str, data: dict[str, Any] | None = None, client_id: str | None = None):
         """
         Sends a message to attached worker node(s)
@@ -1246,6 +1390,10 @@ class WorkerRunner(DistributedRunner):
         self.logs: list[str] = []
         self.worker_cpu_warning_emitted = False
         self._users_dispatcher: UsersDispatcher | None = None
+        # Epoch of the stats window this worker is currently producing reports for.
+        self.current_epoch = 0
+        # Fully serialized reports that failed to send (retained until delivered).
+        self.pending_stats_reports: list[dict[str, Any]] = []
         self.client = rpc.Client(master_host, master_port, self.client_id)
         self.greenlet.spawn(self.worker).link_exception(locust_exception_handler(self.environment))
         self.connect_to_master()
@@ -1258,6 +1406,7 @@ class WorkerRunner(DistributedRunner):
         def on_report_to_master(client_id: str, data: dict[str, Any]):
             data["user_classes_count"] = self.user_classes_count
             data["user_count"] = self.user_count
+            data["epoch"] = self.current_epoch
 
         self.environment.events.report_to_master.add_listener(on_report_to_master)
 
@@ -1371,6 +1520,19 @@ class WorkerRunner(DistributedRunner):
                 if msg.data is not None and "index" in msg.data:
                     self.worker_index = msg.data["index"]
                 self.connection_event.set()
+            case "reset_stats":
+                new_epoch = int(msg.data["epoch"])
+                if new_epoch <= self.current_epoch:
+                    logger.debug(
+                        f"Ignoring reset_stats for epoch {new_epoch}, worker is already at epoch {self.current_epoch}"
+                    )
+                    return
+                # flush pending failed reports and the active buffer under the old
+                # epoch; _send_stats swaps to an empty buffer, so any sample logged
+                # afterwards naturally accumulates under the new epoch
+                self._send_stats()
+                self.exceptions = {}
+                self.current_epoch = new_epoch
             case "spawn":
                 self.client.send(Message("spawning", None, self.client_id))
                 job = msg.data
@@ -1399,6 +1561,8 @@ class WorkerRunner(DistributedRunner):
                 if self.worker_state != STATE_RUNNING and self.worker_state != STATE_SPAWNING:
                     self.stats.clear_all()
                     self.exceptions = {}
+                    self.pending_stats_reports = []
+                    self.current_epoch = 0
                     self.cpu_warning_emitted = False
                     self.worker_cpu_warning_emitted = False
                     self.environment._filter_tasks_by_tags()
@@ -1414,6 +1578,7 @@ class WorkerRunner(DistributedRunner):
                 self.last_received_spawn_timestamp = job["timestamp"]
             case "stop":
                 self.stop()
+                self._send_stats()  # best-effort flush of the final samples before declaring stopped
                 self.client.send(Message("client_stopped", None, self.client_id))
                 # +additional_wait is just a small buffer to account for the random network latencies and/or other
                 # random delays inherent to distributed systems.
@@ -1421,6 +1586,9 @@ class WorkerRunner(DistributedRunner):
                 gevent.sleep(self.environment.stop_timeout + additional_wait)
                 self.client.send(Message("client_ready", __version__, self.client_id))
                 self.worker_state = STATE_INIT
+                # boundary for the next test: undeliverable pre-stop reports must not bleed into it
+                self.pending_stats_reports = []
+                self.current_epoch = 0
             case "quit":
                 logger.info("Got quit message from master, shutting down...")
                 self.stop()
@@ -1488,9 +1656,25 @@ class WorkerRunner(DistributedRunner):
         self.client.send(Message(msg_type, data, self.client_id))
 
     def _send_stats(self) -> None:
-        data: dict[str, Any] = {}
+        # Double buffering: atomically swap the active stats so new samples
+        # accumulate in a fresh object while the old one is serialized and sent.
+        # A failed send therefore never loses increments - the serialized report
+        # is retained in pending_stats_reports and retried.
+        report_stats = self.stats
+        self.environment.stats = RequestStats(use_response_times_cache=False)
+
+        data: dict[str, Any] = {"report_stats": report_stats}
         self.environment.events.report_to_master.fire(client_id=self.client_id, data=data)
-        self.client.send(Message("stats", data, self.client_id))
+
+        try:
+            while self.pending_stats_reports:
+                pending_report = self.pending_stats_reports[0]
+                self.client.send(Message("stats", pending_report, self.client_id))
+                self.pending_stats_reports.pop(0)
+            self.client.send(Message("stats", data, self.client_id))
+        except RPCError as e:
+            logger.error(f"Temporary connection lost to master server: {e}, will retry later.")
+            self.pending_stats_reports.append(data)
 
     def _send_logs(self, current_logs) -> None:
         self.send_message("logs", {"worker_id": self.client_id, "logs": current_logs})
