@@ -49,6 +49,7 @@ export interface ISwarmWorker {
   memoryUsage: number;
   state: (typeof SWARM_STATE)[keyof typeof SWARM_STATE];
   userCount: number;
+  quarantineReasons: string[];
 }
 
 export interface NullChartValue {
@@ -93,6 +94,7 @@ export interface IStatsResponse {
   errors: ISwarmError[];
   workers: ISwarmWorker[];
   workerCount: number;
+  quarantinedWorkerCount: number;
   currentRps: number;
   currentFailPerSec: number;
   totalRps: number;
@@ -114,4 +116,5 @@ export interface ILogsResponse {
 
 export interface IWorkerCountResponse {
   workerCount: number;
+  quarantinedWorkerCount: number;
 }

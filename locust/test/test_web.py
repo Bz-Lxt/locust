@@ -5,7 +5,7 @@ from locust import LoadTestShape, constant, stats
 from locust.argument_parser import get_parser
 from locust.env import Environment
 from locust.log import LogReader
-from locust.runners import Runner
+from locust.runners import STATE_INIT, STATE_QUARANTINED, Runner, WorkerNode
 from locust.stats import StatsCSVFileWriter
 from locust.user import User, task
 from locust.web import WebUI
@@ -1211,6 +1211,45 @@ class TestWebUI(LocustTestCase, _HeaderCheckMixin):
             response = self.web_ui.app.test_client().get("/")
             self.assertEqual(response.status_code, 500)
             self.assertEqual(response.get_data(as_text=True), expected_message)
+
+
+class TestWebUIManifestQuarantine(LocustTestCase):
+    def setUp(self):
+        super().setUp()
+        parser = get_parser(default_config_files=[])
+        self.master_env = Environment(events=locust.events, catch_exceptions=False)
+        self.master_env.parsed_options = parser.parse_args([])
+        self.master = self.master_env.create_master_runner("*", 0)
+        self.web_ui = self.master_env.create_web_ui("127.0.0.1", 0)
+        self.web_ui.app.view_functions["locust.request_stats"].clear_cache()
+        gevent.sleep(0.01)
+        self.web_port = self.web_ui.server.server_port
+
+    def tearDown(self):
+        self.web_ui.stop()
+        self.master.quit()
+        super().tearDown()
+
+    def test_stats_reports_quarantined_workers(self):
+        healthy = WorkerNode("healthy_worker", state=STATE_INIT)
+        bad = WorkerNode("bad_worker", state=STATE_QUARANTINED)
+        bad.quarantine_reasons = ["locustfile content differs: locustfile.py"]
+        self.master.clients["healthy_worker"] = healthy
+        self.master.clients["bad_worker"] = bad
+
+        response = requests.get(f"http://127.0.0.1:{self.web_port}/stats/requests").json()
+
+        self.assertEqual(1, response["worker_count"])
+        self.assertEqual(1, response["quarantined_worker_count"])
+        workers = {worker["id"]: worker for worker in response["workers"]}
+        self.assertEqual(STATE_INIT, workers["healthy_worker"]["state"])
+        self.assertEqual([], workers["healthy_worker"]["quarantine_reasons"])
+        self.assertEqual(STATE_QUARANTINED, workers["bad_worker"]["state"])
+        self.assertEqual(["locustfile content differs: locustfile.py"], workers["bad_worker"]["quarantine_reasons"])
+
+        worker_count_response = requests.get(f"http://127.0.0.1:{self.web_port}/worker-count").json()
+        self.assertEqual(1, worker_count_response["worker_count"])
+        self.assertEqual(1, worker_count_response["quarantined_worker_count"])
 
 
 class TestWebUIAuth(LocustTestCase):

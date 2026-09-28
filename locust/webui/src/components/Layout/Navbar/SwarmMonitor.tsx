@@ -1,4 +1,4 @@
-import { Box, Divider, Tooltip, Typography } from '@mui/material';
+import { Box, Chip, Divider, Tooltip, Typography } from '@mui/material';
 import { connect } from 'react-redux';
 
 import { SWARM_STATE } from 'constants/swarm';
@@ -7,7 +7,11 @@ import { IRootState } from 'redux/store';
 import { ISwarmState } from 'types/swarm.types';
 
 interface ISwarmMonitor
-  extends Pick<ISwarmState, 'isDistributed' | 'host' | 'state' | 'workerCount'>,
+  extends
+    Pick<
+      ISwarmState,
+      'isDistributed' | 'host' | 'state' | 'workerCount' | 'quarantinedWorkerCount'
+    >,
     Pick<IUiState, 'currentRps' | 'failRatio' | 'userCount'> {}
 
 function SwarmMonitor({
@@ -18,6 +22,7 @@ function SwarmMonitor({
   failRatio,
   userCount,
   workerCount,
+  quarantinedWorkerCount = 0,
 }: ISwarmMonitor) {
   return (
     <Box
@@ -60,9 +65,22 @@ function SwarmMonitor({
           <Divider flexItem orientation='vertical' />
           <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: { md: 'center' } }}>
             <Typography sx={{ fontWeight: 'bold' }}>Workers</Typography>
-            <Typography noWrap variant='button'>
-              {workerCount}
-            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', columnGap: 1 }}>
+              <Typography noWrap variant='button'>
+                {workerCount}
+              </Typography>
+              {quarantinedWorkerCount > 0 && (
+                <Tooltip title='Workers quarantined because their execution manifest (locustfile, user classes or version) does not match the master. They are not generating traffic.'>
+                  <Chip
+                    color='error'
+                    data-testid='quarantined-workers-chip'
+                    label={`${quarantinedWorkerCount} quarantined`}
+                    size='small'
+                    variant='outlined'
+                  />
+                </Tooltip>
+              )}
+            </Box>
           </Box>
         </>
       )}
@@ -83,7 +101,7 @@ function SwarmMonitor({
 }
 
 const storeConnector = ({
-  swarm: { isDistributed, state, host, workerCount },
+  swarm: { isDistributed, state, host, workerCount, quarantinedWorkerCount },
   ui: { currentRps, failRatio, userCount },
 }: IRootState) => ({
   isDistributed,
@@ -93,6 +111,7 @@ const storeConnector = ({
   failRatio,
   userCount,
   workerCount,
+  quarantinedWorkerCount,
 });
 
 export default connect(storeConnector)(SwarmMonitor);

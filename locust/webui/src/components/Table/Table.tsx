@@ -1,3 +1,4 @@
+import { ReactNode } from 'react';
 import {
   Paper,
   Table as MuiTable,
@@ -14,7 +15,7 @@ import { roundToDecimalPlaces } from 'utils/number';
 
 interface ITable<Row> extends ISortByFieldOptions<Row> {
   rows: Row[];
-  structure: ITableStructure[];
+  structure: ITableStructure<any>[];
   children?: React.ReactElement;
   onTableHeadClick?: (event: React.MouseEvent<HTMLElement>) => void;
   currentSortField?: string;
@@ -26,15 +27,16 @@ export interface ITableRowProps {
   structureKey?: string;
 }
 
-export interface ITableRowContent {
-  content: string | number;
-  formatter?: (content: string | number) => string;
+export interface ITableRowContent<Row> {
+  content: any;
+  row?: Row;
+  formatter?: (content: any, row?: Row) => ReactNode;
   round?: number;
 }
 
-function TableRowContent({ content, formatter, round }: ITableRowContent) {
+function TableRowContent<Row>({ content, row, formatter, round }: ITableRowContent<Row>) {
   if (formatter) {
-    return formatter(content);
+    return formatter(content, row);
   }
 
   if (round) {
@@ -87,7 +89,7 @@ export default function Table<Row extends Record<string, any> = Record<string, s
             <TableRow key={`${row.name}-${index}`}>
               {structure.map(({ key, ...tableRowProps }, index) => (
                 <TableCell key={`table-row=${index}`}>
-                  <TableRowContent content={row[key]} {...tableRowProps} />
+                  <TableRowContent content={row[key]} row={row} {...tableRowProps} />
                 </TableCell>
               ))}
             </TableRow>

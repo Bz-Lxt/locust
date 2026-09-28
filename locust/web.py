@@ -515,6 +515,7 @@ class WebUI:
                 }
 
             if isinstance(environment.runner, MasterRunner):
+                quarantined_workers = environment.runner.clients.quarantined
                 workers = [
                     {
                         "id": worker.id,
@@ -522,12 +523,14 @@ class WebUI:
                         "user_count": worker.user_count,
                         "cpu_usage": worker.cpu_usage,
                         "memory_usage": worker.memory_usage,
+                        "quarantine_reasons": list(worker.quarantine_reasons),
                     }
                     for worker in environment.runner.clients.values()
                 ]
 
                 report["workers"] = workers
                 report["worker_count"] = environment.runner.worker_count
+                report["quarantined_worker_count"] = len(quarantined_workers)
 
             report["state"] = environment.runner.state
             report["user_count"] = environment.runner.user_count
@@ -609,11 +612,12 @@ class WebUI:
         @app_blueprint.route("/worker-count")
         @self.auth_required_if_enabled
         def get_worker_count():
-            return {
-                "worker_count": self.environment.runner.worker_count
-                if isinstance(self.environment.runner, MasterRunner)
-                else 0
-            }
+            if isinstance(self.environment.runner, MasterRunner):
+                return {
+                    "worker_count": self.environment.runner.worker_count,
+                    "quarantined_worker_count": len(self.environment.runner.clients.quarantined),
+                }
+            return {"worker_count": 0, "quarantined_worker_count": 0}
 
         app.register_blueprint(app_blueprint)
 

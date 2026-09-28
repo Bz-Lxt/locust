@@ -30,6 +30,7 @@ from . import argument_parser
 from .dispatch import UsersDispatcher
 from .exception import RPCError, RPCReceiveError, RPCSendError, StopTest
 from .log import get_logs, greenlet_exception_logger
+from .manifest import build_manifest, compare_manifests
 from .rpc import Message, rpc
 from .stats import RequestStats, StatsError, setup_distributed_stats_event_listeners
 from .util.directory import get_abspaths_in
@@ -41,7 +42,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-STATE_INIT, STATE_SPAWNING, STATE_RUNNING, STATE_CLEANUP, STATE_STOPPING, STATE_STOPPED, STATE_MISSING = [
+(
+    STATE_INIT,
+    STATE_SPAWNING,
+    STATE_RUNNING,
+    STATE_CLEANUP,
+    STATE_STOPPING,
+    STATE_STOPPED,
+    STATE_MISSING,
+    STATE_QUARANTINED,
+) = [
     "ready",
     "spawning",
     "running",
@@ -49,6 +59,7 @@ STATE_INIT, STATE_SPAWNING, STATE_RUNNING, STATE_CLEANUP, STATE_STOPPING, STATE_
     "stopping",
     "stopped",
     "missing",
+    "quarantined",
 ]
 WORKER_REPORT_INTERVAL = 3.0
 WORKER_LOG_REPORT_INTERVAL = 10
@@ -597,6 +608,8 @@ class WorkerNode:
         self.memory_usage: int = 0
         # The reported users running on the worker
         self.user_classes_count: dict[str, int] = {}
+        # Non-empty when the worker has been quarantined due to a manifest mismatch
+        self.quarantine_reasons: list[str] = []
 
     @property
     def user_count(self) -> int:
@@ -629,6 +642,10 @@ class WorkerNodes(MutableMapping):
     @property
     def missing(self) -> list[WorkerNode]:
         return self.get_by_state(STATE_MISSING)
+
+    @property
+    def quarantined(self) -> list[WorkerNode]:
+        return self.get_by_state(STATE_QUARANTINED)
 
     def __setitem__(self, k: str, v: WorkerNode) -> None:
         self._worker_nodes[k] = v
@@ -696,6 +713,9 @@ class MasterRunner(DistributedRunner):
             if client_id not in self.clients:
                 logger.info("Discarded report from unrecognized worker %s", client_id)
                 return
+            if self.clients[client_id].state == STATE_QUARANTINED:
+                logger.debug("Discarded report from quarantined worker %s", client_id)
+                return
             self.clients[client_id].user_classes_count = data["user_classes_count"]
 
         self.environment.events.worker_report.add_listener(on_worker_report)
@@ -709,6 +729,99 @@ class MasterRunner(DistributedRunner):
     def rebalancing_enabled(self) -> bool:
         return self.environment.parsed_options is not None and cast(
             bool, self.environment.parsed_options.enable_rebalancing
+        )
+
+    def allow_legacy_workers(self) -> bool:
+        return self.environment.parsed_options is not None and cast(
+            bool, self.environment.parsed_options.allow_legacy_workers
+        )
+
+    @functools.cached_property
+    def reference_manifest(self) -> dict[str, Any]:
+        """The master's own execution manifest that every connecting worker must match."""
+        return build_manifest(self.environment)
+
+    def _log_worker_version_warning(self, client_id: str, worker_version: Any) -> None:
+        if worker_version == -1 or worker_version == __version__:
+            return
+        try:
+            if worker_version[0:4] == __version__[0:4]:
+                logger.debug(
+                    f"A worker ({client_id}) running a different patch version ({repr(worker_version)}) connected, master version is {repr(__version__)}"
+                )
+            else:
+                logger.warning(
+                    f"A worker ({client_id}) running a different version ({worker_version}) connected, master version is {__version__}"
+                )
+        except (TypeError, IndexError):
+            logger.warning(
+                f"A worker ({client_id}) running an unrecognized version ({worker_version!r}) connected, master version is {__version__}"
+            )
+
+    def _admit_worker(self, client_id: str) -> None:
+        """Register a worker as healthy and let it join the dispatch pool."""
+        existing = self.clients.get(client_id)
+        self.send_message("ack", client_id=client_id, data={"index": self.get_worker_index(client_id)})
+
+        if (
+            existing is not None
+            and existing.state != STATE_QUARANTINED
+            and existing.state != STATE_MISSING
+        ):
+            # duplicate client_ready from a still-healthy connection (e.g. a ZMQ-level reconnect
+            # where the master kept the node): the worker is already in the pool, don't register it twice
+            logger.debug(
+                f"{client_id} (index {self.get_worker_index(client_id)}) sent a duplicate client_ready, "
+                "keeping the existing registration."
+            )
+            return
+
+        self.environment.events.worker_connect.fire(client_id=client_id)
+        self.clients[client_id] = WorkerNode(client_id, heartbeat_liveness=HEARTBEAT_LIVENESS)
+        if self._users_dispatcher is not None:
+            self._users_dispatcher.add_worker(worker_node=self.clients[client_id])
+            if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
+                # TODO: Test this situation
+                self.start(self.target_user_count, self.spawn_rate)
+        logger.info(
+            f"{client_id} (index {self.get_worker_index(client_id)}) reported as ready. "
+            f"{len(self.clients.ready + self.clients.running + self.clients.spawning)} workers connected."
+        )
+        if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
+            self.start(self.target_user_count, self.spawn_rate)
+
+    def _quarantine_worker(self, client_id: str, reasons: list[str], worker_manifest: dict[str, Any] | None) -> None:
+        """
+        Keep the connection for observability but never let the worker join the dispatch
+        pool, so a mismatching worker cannot generate any traffic.
+        """
+        existing = self.clients.get(client_id)
+        node = WorkerNode(client_id, state=STATE_QUARANTINED, heartbeat_liveness=HEARTBEAT_LIVENESS)
+        node.quarantine_reasons = reasons
+        self.clients[client_id] = node
+
+        if existing is not None and existing.state != STATE_QUARANTINED and self._users_dispatcher is not None:
+            # The same client id was admitted before (reconnect with a now-different locustfile).
+            self._users_dispatcher.remove_worker(existing)
+
+        self.send_message(
+            "manifest_rejected",
+            client_id=client_id,
+            data={
+                "reasons": reasons,
+                "reference_manifest": self.reference_manifest,
+                "worker_manifest": worker_manifest,
+            },
+        )
+        logger.error(
+            f"Worker {client_id} (index {self.get_worker_index(client_id)}) quarantined due to an "
+            f"execution manifest mismatch:\n  - " + "\n  - ".join(reasons)
+        )
+        self.environment.events.worker_manifest_rejected.fire(
+            client_id=client_id,
+            reasons=reasons,
+            worker_manifest=worker_manifest,
+            reference_manifest=self.reference_manifest,
         )
 
     def get_worker_index(self, client_id):
@@ -744,9 +857,23 @@ class MasterRunner(DistributedRunner):
 
         active_workers = self.clients.ready + self.clients.running + self.clients.spawning
         num_workers = len(active_workers)
+        num_quarantined = len(self.clients.quarantined)
         if not num_workers:
-            logger.warning("You can't start a distributed test before at least one worker processes has connected")
+            if num_quarantined:
+                logger.warning(
+                    f"You can't start a distributed test: all {num_quarantined} connected worker(s) are "
+                    "quarantined because their execution manifest doesn't match the master's. Fix their "
+                    "locustfiles (or restart the master with --allow-legacy-workers for legacy workers)."
+                )
+            else:
+                logger.warning("You can't start a distributed test before at least one worker processes has connected")
             return
+
+        if num_quarantined:
+            logger.info(
+                f"Starting with {num_workers} healthy worker(s); "
+                f"{num_quarantined} worker(s) quarantined due to manifest mismatch and excluded from the run."
+            )
 
         for user_class in self.user_classes:
             if self.environment.host:
@@ -917,10 +1044,16 @@ class MasterRunner(DistributedRunner):
         self.greenlet.kill(block=True)
 
     def check_stopped(self) -> None:
+        # quarantined workers don't participate in runs and must not hold up (or trigger)
+        # a stopped transition
+        participating_clients = [x for x in self.clients.all if x.state != STATE_QUARANTINED]
+        if not participating_clients and len(self.clients) > 0 and self.state != STATE_STOPPING:
+            # only quarantined workers are connected and no stop is in progress; stay ready
+            return
         if (
             self.state == STATE_STOPPING
-            and all(x.state == STATE_INIT for x in self.clients.all)
-            or all(x.state not in (STATE_RUNNING, STATE_SPAWNING, STATE_INIT) for x in self.clients.all)
+            and all(x.state == STATE_INIT for x in participating_clients)
+            or all(x.state not in (STATE_RUNNING, STATE_SPAWNING, STATE_INIT) for x in participating_clients)
         ):
             self.update_state(STATE_STOPPED)
 
@@ -937,7 +1070,13 @@ class MasterRunner(DistributedRunner):
                 if client.state == STATE_MISSING and client.heartbeat <= HEARTBEAT_DEAD_INTERNAL:
                     missing_clients_to_be_removed.append(client.id)
 
-                if client.heartbeat < 0 and client.state != STATE_MISSING:
+                if client.state == STATE_QUARANTINED:
+                    # quarantined workers stay visible while alive but never enter the dispatch pool;
+                    # once they are dead long enough they are removed like missing workers
+                    client.heartbeat -= 1
+                    if client.heartbeat <= HEARTBEAT_DEAD_INTERNAL:
+                        missing_clients_to_be_removed.append(client.id)
+                elif client.heartbeat < 0 and client.state != STATE_MISSING:
                     logger.info(f"Worker {str(client.id)} failed to send heartbeat, setting state to missing.")
                     client.state = STATE_MISSING
                     client.user_classes_count = {}
@@ -1016,38 +1155,57 @@ class MasterRunner(DistributedRunner):
 
     def handle_message(self, client_id: str, msg: Message) -> None:
         match msg.type:
+            case "worker_manifest":
+                # New workers announce their manifest as a separate message sent right before
+                # client_ready. Old masters don't know this message and simply ignore it, so a new
+                # worker connecting to an old master keeps working with the legacy handshake.
+                if isinstance(msg.data, dict) and isinstance(msg.data.get("manifest"), dict):
+                    self._pending_manifests[client_id] = msg.data
             case "client_ready":
                 if not msg.data:
                     logger.error(f"An old (pre 2.0) worker tried to connect ({client_id}). That's not going to work.")
                     return
-                elif msg.data != __version__ and msg.data != -1:
-                    if msg.data[0:4] == __version__[0:4]:
-                        logger.debug(
-                            f"A worker ({client_id}) running a different patch version ({repr(msg.data)}) connected, master version is {repr(__version__)}"
+                manifest_payload: dict | None = None
+                if isinstance(msg.data, dict):
+                    # embedded payload (explicit dict client_ready)
+                    manifest_payload = msg.data
+                elif client_id in self._pending_manifests:
+                    # new worker that announced its manifest via a preceding worker_manifest message
+                    manifest_payload = self._pending_manifests.pop(client_id)
+                if manifest_payload is not None:
+                    worker_manifest = manifest_payload.get("manifest")
+                    self._log_worker_version_warning(client_id, manifest_payload.get("version"))
+                    if not isinstance(worker_manifest, dict):
+                        self._quarantine_worker(
+                            client_id,
+                            ["worker connected without an execution manifest (manifest field missing)"],
+                            None,
                         )
+                        return
+                    mismatch_reasons = compare_manifests(self.reference_manifest, worker_manifest)
+                    if mismatch_reasons:
+                        self._quarantine_worker(client_id, mismatch_reasons, worker_manifest)
                     else:
-                        logger.warning(
-                            f"A worker ({client_id}) running a different version ({msg.data}) connected, master version is {__version__}"
-                        )
-                self.send_message("ack", client_id=client_id, data={"index": self.get_worker_index(client_id)})
-                self.environment.events.worker_connect.fire(client_id=msg.node_id)
-                client_already_connected = client_id in self.clients
-                self.clients[client_id] = WorkerNode(client_id, heartbeat_liveness=HEARTBEAT_LIVENESS)
-                if self._users_dispatcher is not None:
-                    self._users_dispatcher.add_worker(worker_node=self.clients[client_id])
-                    if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
-                        # TODO: Test this situation
-                        self.start(self.target_user_count, self.spawn_rate)
-                if client_already_connected:
-                    logger.debug(
-                        f"{client_id} (index {self.get_worker_index(client_id)}) reported as ready (duplicate message). {len(self.clients.ready + self.clients.running + self.clients.spawning)} workers connected."
-                    )
+                        self._admit_worker(client_id)
                 else:
-                    logger.info(
-                        f"{client_id} (index {self.get_worker_index(client_id)}) reported as ready. {len(self.clients.ready + self.clients.running + self.clients.spawning)} workers connected."
-                    )
-                if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
-                    self.start(self.target_user_count, self.spawn_rate)
+                    # Legacy protocol: bare version string/int, no execution manifest
+                    self._log_worker_version_warning(client_id, msg.data)
+                    if self.allow_legacy_workers():
+                        logger.warning(
+                            f"Worker {client_id} reported no execution manifest (legacy worker). It is allowed "
+                            "to join because --allow-legacy-workers is set, but its traffic cannot be guaranteed "
+                            "to match the master's locustfile."
+                        )
+                        self._admit_worker(client_id)
+                    else:
+                        self._quarantine_worker(
+                            client_id,
+                            [
+                                "worker did not report an execution manifest (legacy worker?). Upgrade the worker, "
+                                "or start the master with --allow-legacy-workers to explicitly allow it."
+                            ],
+                            None,
+                        )
                 # emit a warning if the worker's clock seem to be out of sync with our clock
                 # if abs(time() - msg.data["time"]) > 5.0:
                 #    warnings.warn("The worker node's clock seem to be out of sync. For the statistics to be correct the different locust servers need to have synchronized clocks.")
@@ -1112,14 +1270,21 @@ class MasterRunner(DistributedRunner):
                     c = self.clients[msg.node_id]
                     c.heartbeat = HEARTBEAT_LIVENESS
                     client_state = msg.data["state"]
-                    if c.state == STATE_MISSING:
-                        logger.info(f"Worker {str(c.id)} self-healed with heartbeat, setting state to {client_state}.")
-                        if self._users_dispatcher is not None:
-                            self._users_dispatcher.add_worker(worker_node=c)
-                            if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
-                                # TODO: Test this situation
-                                self.start(self.target_user_count, self.spawn_rate)
-                    c.state = client_state
+                    if c.state == STATE_QUARANTINED:
+                        # a heartbeat must never resurrect a quarantined worker; it can only be
+                        # re-admitted by sending a matching client_ready
+                        logger.debug(f"Received heartbeat from quarantined worker {c.id}, keeping it isolated.")
+                    else:
+                        if c.state == STATE_MISSING:
+                            logger.info(
+                                f"Worker {str(c.id)} self-healed with heartbeat, setting state to {client_state}."
+                            )
+                            if self._users_dispatcher is not None:
+                                self._users_dispatcher.add_worker(worker_node=c)
+                                if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
+                                    # TODO: Test this situation
+                                    self.start(self.target_user_count, self.spawn_rate)
+                        c.state = client_state
                     c.cpu_usage = msg.data["current_cpu_usage"]
                     if not c.cpu_warning_emitted and c.cpu_usage > 90:
                         self.worker_cpu_warning_emitted = True  # used to fail the test in the end
@@ -1137,14 +1302,23 @@ class MasterRunner(DistributedRunner):
                 self.environment.events.worker_report.fire(client_id=msg.node_id, data=msg.data)
             case "spawning":
                 try:
-                    self.clients[msg.node_id].state = STATE_SPAWNING
+                    node = self.clients[msg.node_id]
                 except KeyError:
                     logger.warning(f"Got spawning message from unknown worker {msg.node_id}. Asking worker to quit.")
                     self.server.send_to_client(Message("quit", None, msg.node_id))
+                else:
+                    if node.state == STATE_QUARANTINED:
+                        logger.warning(f"Got spawning message from quarantined worker {msg.node_id}, ignoring it.")
+                    else:
+                        node.state = STATE_SPAWNING
             case "spawning_complete":
                 # a worker finished spawning (this happens multiple times during rampup)
-                self.clients[msg.node_id].state = STATE_RUNNING
-                self.clients[msg.node_id].user_classes_count = msg.data["user_classes_count"]
+                node = self.clients[msg.node_id]
+                if node.state == STATE_QUARANTINED:
+                    logger.warning(f"Got spawning_complete message from quarantined worker {msg.node_id}, ignoring it.")
+                else:
+                    node.state = STATE_RUNNING
+                    node.user_classes_count = msg.data["user_classes_count"]
             case "logs":
                 self.environment.update_worker_logs(msg.data)
             case "quit":
@@ -1246,6 +1420,8 @@ class WorkerRunner(DistributedRunner):
         self.logs: list[str] = []
         self.worker_cpu_warning_emitted = False
         self._users_dispatcher: UsersDispatcher | None = None
+        self.quarantined = False
+        self.quarantine_reasons: list[str] = []
         self.client = rpc.Client(master_host, master_port, self.client_id)
         self.greenlet.spawn(self.worker).link_exception(locust_exception_handler(self.environment))
         self.connect_to_master()
@@ -1351,8 +1527,13 @@ class WorkerRunner(DistributedRunner):
         try:
             self.client.close()
             self.client = rpc.Client(self.master_host, self.master_port, self.client_id)
+            # the new master server has no knowledge of us, so re-register and pass the gate again
+            self.client.send(Message("client_ready", self._client_ready_data(), self.client_id))
         except RPCError as e:
             logger.error(f"Temporary failure when resetting connection: {e}, will retry later.")
+
+    def _client_ready_data(self) -> dict[str, Any]:
+        return {"version": __version__, "manifest": build_manifest(self.environment)}
 
     def worker(self) -> NoReturn:
         self.last_received_spawn_timestamp = 0
@@ -1370,8 +1551,36 @@ class WorkerRunner(DistributedRunner):
                 # backward-compatible support of masters that do not send a worker index
                 if msg.data is not None and "index" in msg.data:
                     self.worker_index = msg.data["index"]
+                if self.quarantined:
+                    # the master accepted us after a reconnect, leave the quarantine
+                    self.quarantined = False
+                    self.quarantine_reasons = []
+                    if self.worker_state == STATE_QUARANTINED:
+                        self.worker_state = STATE_INIT
+                    logger.info("Worker admitted by the master, execution manifest now matches.")
                 self.connection_event.set()
+            case "manifest_rejected":
+                reasons = msg.data.get("reasons", []) if isinstance(msg.data, dict) else []
+                self.quarantined = True
+                self.quarantine_reasons = reasons
+                self.worker_state = STATE_QUARANTINED
+                logger.error(
+                    "Quarantined by the master because the execution manifest doesn't match "
+                    f"(version {__version__}). Reasons:\n - " + "\n - ".join(reasons)
+                )
+                # unblock connect_to_master so the worker stays alive for inspection/reconnect instead of retrying
+                self.connection_event.set()
+                parsed_options = self.environment.parsed_options
+                if parsed_options is not None and getattr(parsed_options, "strict_manifest", False):
+                    logger.error("Exiting because --strict-manifest was set.")
+                    sys.exit(1)
             case "spawn":
+                if self.quarantined:
+                    logger.warning(
+                        "Ignoring spawn message from master because this worker is quarantined. "
+                        "Fix the locustfile and restart the worker."
+                    )
+                    return
                 self.client.send(Message("spawning", None, self.client_id))
                 job = msg.data
                 if job["timestamp"] <= self.last_received_spawn_timestamp:
@@ -1419,7 +1628,7 @@ class WorkerRunner(DistributedRunner):
                 # random delays inherent to distributed systems.
                 additional_wait = int(os.getenv("LOCUST_WORKER_ADDITIONAL_WAIT_BEFORE_READY_AFTER_STOP", 0))
                 gevent.sleep(self.environment.stop_timeout + additional_wait)
-                self.client.send(Message("client_ready", __version__, self.client_id))
+                self.client.send(Message("client_ready", self._client_ready_data(), self.client_id))
                 self.worker_state = STATE_INIT
             case "quit":
                 logger.info("Got quit message from master, shutting down...")
@@ -1497,7 +1706,7 @@ class WorkerRunner(DistributedRunner):
 
     def connect_to_master(self):
         self.retry += 1
-        self.client.send(Message("client_ready", __version__, self.client_id))
+        self.client.send(Message("client_ready", self._client_ready_data(), self.client_id))
         try:
             success = self.connection_event.wait(timeout=CONNECT_TIMEOUT)
         except KeyboardInterrupt:

@@ -40,6 +40,7 @@ export default function useFetchStats() {
       failRatio,
       workers,
       workerCount,
+      quarantinedWorkerCount,
       userCount,
       totalAvgResponseTime,
     } = statsData;
@@ -83,7 +84,7 @@ export default function useFetchStats() {
     });
     updateCharts(newChartEntry);
 
-    setSwarm({ state, workerCount });
+    setSwarm({ state, workerCount, quarantinedWorkerCount });
   }, [statsData]);
 
   useInterval(refetchStats, STATS_REFETCH_INTERVAL, {

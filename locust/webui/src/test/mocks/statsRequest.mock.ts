@@ -158,6 +158,7 @@ export const statsResponseTransformed = {
   } as ICharts,
   userCount: 1,
   workers: undefined,
+  quarantinedWorkerCount: 0,
 };
 
 export const tasksResponseTransformed = {

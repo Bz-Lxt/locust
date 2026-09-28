@@ -68,4 +68,36 @@ describe('SwarmMonitor', () => {
 
     expect(queryByText('Workers')).toBeNull();
   });
+
+  test('should show a quarantine chip when workers are quarantined', () => {
+    const { getByTestId, getByText } = renderWithProvider(<SwarmMonitor />, {
+      swarm: {
+        ...swarmStateMock,
+        isDistributed: true,
+        workerCount: 2,
+        quarantinedWorkerCount: 1,
+        state: SWARM_STATE.RUNNING,
+      },
+      ui: mockUiState,
+    });
+
+    const chip = getByTestId('quarantined-workers-chip');
+    expect(chip.textContent).toBe('1 quarantined');
+    expect(getByText('Workers')).toBeTruthy();
+  });
+
+  test('should not show a quarantine chip when no workers are quarantined', () => {
+    const { queryByTestId } = renderWithProvider(<SwarmMonitor />, {
+      swarm: {
+        ...swarmStateMock,
+        isDistributed: true,
+        workerCount: 2,
+        quarantinedWorkerCount: 0,
+        state: SWARM_STATE.RUNNING,
+      },
+      ui: mockUiState,
+    });
+
+    expect(queryByTestId('quarantined-workers-chip')).toBeNull();
+  });
 });

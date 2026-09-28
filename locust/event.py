@@ -164,6 +164,19 @@ class Events:
     :param client_id: Client id of the connected worker
     """
 
+    worker_manifest_rejected: EventHook
+    """
+    Fired on master when a connecting worker's execution manifest does not match the master's,
+    so the worker has been quarantined (it will not receive any spawn jobs).
+
+    Event arguments:
+
+    :param client_id: Client id of the rejected worker
+    :param reasons: List of human-readable manifest mismatch reasons
+    :param worker_manifest: The manifest reported by the worker (may be None for legacy workers)
+    :param reference_manifest: The master's reference manifest
+    """
+
     spawning_complete: EventHook
     """
     Fired when all simulated users has been spawned. The event is fired on master first, and then distributed to workers.

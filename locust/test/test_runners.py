@@ -8,16 +8,21 @@ from locust.env import Environment
 from locust.exception import RPCError, RPCReceiveError, StopUser
 from locust.log import LogReader
 from locust.main import create_environment
+from locust.manifest import build_manifest
 from locust.rpc import Message
 from locust.runners import (
+    HEARTBEAT_DEAD_INTERNAL,
+    HEARTBEAT_INTERVAL,
     STATE_INIT,
     STATE_MISSING,
+    STATE_QUARANTINED,
     STATE_RUNNING,
     STATE_SPAWNING,
     STATE_STOPPED,
     STATE_STOPPING,
     LocalRunner,
     WorkerNode,
+    WorkerNodes,
     WorkerRunner,
 )
 from locust.stats import RequestStats
@@ -46,6 +51,20 @@ NETWORK_BROKEN = "network broken"
 BAD_MESSAGE = "bad message"
 UNRECOGNIZED_HOST_MESSAGE = "unrecognized host message"
 UNRECOGNIZED_MESSAGE = "unrecognized message"
+
+# The master test runners below load no locustfile (available_user_classes is unset),
+# so an empty manifest is the matching one for new-protocol client_ready messages.
+EMPTY_MANIFEST = build_manifest(Environment())
+
+
+class ManifestDispatcherUser(User):
+    @task
+    def noop(self):
+        pass
+
+
+def client_ready_message(client_id, manifest=EMPTY_MANIFEST, version=__version__):
+    return Message("client_ready", {"version": version, "manifest": manifest}, client_id)
 
 
 def mocked_rpc(raise_on_close=True):
@@ -2288,14 +2307,14 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_worker_connect(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(client_ready_message("zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
             )
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client2"))
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client3"))
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client4"))
+            server.mocked_send(client_ready_message("zeh_fake_client2"))
+            server.mocked_send(client_ready_message("zeh_fake_client3"))
+            server.mocked_send(client_ready_message("zeh_fake_client4"))
             self.assertEqual(4, len(master.clients))
 
             server.mocked_send(Message("quit", None, "zeh_fake_client3"))
@@ -2307,22 +2326,37 @@ class TestMasterRunner(LocustRunnerTestCase):
             server.mocked_send(Message("client_ready", None, "1.x_style_client_should_not_be_allowed"))
             self.assertEqual(1, len(self.mocked_log.error))
             self.assertEqual(0, len(master.clients))
-            server.mocked_send(Message("client_ready", "abcd", "other_version_mismatch_should_just_give_a_warning"))
-            self.assertEqual(1, len(self.mocked_log.warning))
+            # legacy workers (bare version string, no execution manifest) are quarantined by default
+            server.mocked_send(Message("client_ready", "abcd", "legacy_version_mismatch_is_quarantined"))
             self.assertEqual(1, len(master.clients))
-            server.mocked_send(Message("client_ready", -1, "version_check_bypass_should_not_warn"))
+            self.assertEqual(STATE_QUARANTINED, master.clients["legacy_version_mismatch_is_quarantined"].state)
             self.assertEqual(1, len(self.mocked_log.warning))
+            server.mocked_send(Message("client_ready", -1, "version_check_bypass_is_still_quarantined"))
             self.assertEqual(2, len(master.clients))
-            server.mocked_send(
-                Message("client_ready", __version__ + "1", "difference_in_patch_version_should_not_warn")
-            )
+            self.assertEqual(STATE_QUARANTINED, master.clients["version_check_bypass_is_still_quarantined"].state)
+            server.mocked_send(Message("client_ready", __version__ + "1", "legacy_patch_version_is_quarantined"))
             self.assertEqual(3, len(master.clients))
-            self.assertEqual(1, len(self.mocked_log.warning))
+            self.assertEqual(STATE_QUARANTINED, master.clients["legacy_patch_version_is_quarantined"].state)
+
+    def test_legacy_workers_allowed_when_option_set(self):
+        options = get_parser().parse_args(["--allow-legacy-workers"])
+        self.environment.parsed_options = options
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(Message("client_ready", __version__, "legacy_client_allowed"))
+            self.assertEqual(1, master.worker_count)
+            self.assertEqual(STATE_INIT, master.clients["legacy_client_allowed"].state)
+            self.assertTrue(
+                any("execution manifest" in line for line in self.mocked_log.warning),
+                "Allowing a legacy worker must log a prominent warning",
+            )
+            ack_messages = [m for m in server.get_messages("ack") if m.node_id == "legacy_client_allowed"]
+            self.assertEqual(1, len(ack_messages))
 
     def test_worker_stats_report_median(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(client_ready_message("fake_client"))
 
             master.stats.get("/", "GET").log(100, 23455)
             master.stats.get("/", "GET").log(800, 23455)
@@ -2339,7 +2373,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_worker_stats_report_with_none_response_times(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(client_ready_message("fake_client"))
 
             master.stats.get("/mixed", "GET").log(0, 23455)
             master.stats.get("/mixed", "GET").log(800, 23455)
@@ -2365,7 +2399,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_master_marks_downed_workers_as_missing(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(client_ready_message("fake_client"))
             sleep(6)
             # print(master.clients['fake_client'].__dict__)
             assert master.clients["fake_client"].state == STATE_MISSING
@@ -2381,8 +2415,8 @@ class TestMasterRunner(LocustRunnerTestCase):
             patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0.1"),
         ):
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client2"))
+            server.mocked_send(client_ready_message("fake_client1"))
+            server.mocked_send(client_ready_message("fake_client2"))
 
             master.start(1, 2)
             server.mocked_send(Message("spawning", None, "fake_client1"))
@@ -2438,9 +2472,9 @@ class TestMasterRunner(LocustRunnerTestCase):
             patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0.1"),
         ):
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client2"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client3"))
+            server.mocked_send(client_ready_message("fake_client1"))
+            server.mocked_send(client_ready_message("fake_client2"))
+            server.mocked_send(client_ready_message("fake_client3"))
 
             master.start(3, 3)
             server.mocked_send(Message("spawning", None, "fake_client1"))
@@ -2510,9 +2544,9 @@ class TestMasterRunner(LocustRunnerTestCase):
             patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0.1"),
         ):
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client2"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client3"))
+            server.mocked_send(client_ready_message("fake_client1"))
+            server.mocked_send(client_ready_message("fake_client2"))
+            server.mocked_send(client_ready_message("fake_client3"))
 
             master.start(3, 3)
             server.mocked_send(Message("spawning", None, "fake_client1"))
@@ -2591,7 +2625,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_master_total_stats(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(client_ready_message("fake_client"))
             stats = RequestStats()
             stats.log_request("GET", "/1", 100, 3546)
             stats.log_request("GET", "/1", 800, 56743)
@@ -2626,7 +2660,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_master_total_stats_with_none_response_times(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(client_ready_message("fake_client"))
             stats = RequestStats()
             stats.log_request("GET", "/1", 100, 3546)
             stats.log_request("GET", "/1", 800, 56743)
@@ -2682,7 +2716,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 master = self.get_runner()
                 self.environment.stats.reset_all()
                 mocked_time.return_value += 1.0234
-                server.mocked_send(Message("client_ready", __version__, "fake_client"))
+                server.mocked_send(client_ready_message("fake_client"))
                 stats = RequestStats()
                 stats.log_request("GET", "/1", 100, 3546)
                 stats.log_request("GET", "/1", 800, 56743)
@@ -2747,7 +2781,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(client_ready_message("zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
@@ -2764,7 +2798,7 @@ class TestMasterRunner(LocustRunnerTestCase):
             master.clients["zeh_fake_client1"].user_classes_count = {"TestUser": 100}
 
             # let another worker connect
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client2"))
+            server.mocked_send(client_ready_message("zeh_fake_client2"))
             self.assertEqual(2, len(master.clients))
             sleep(0.1)  # give time for messages to be sent to clients
             spawn_messages = server.get_messages("spawn")
@@ -2802,8 +2836,8 @@ class TestMasterRunner(LocustRunnerTestCase):
             patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
         ):
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "missing"))
-            server.mocked_send(Message("client_ready", __version__, "healthy"))
+            server.mocked_send(client_ready_message("missing"))
+            server.mocked_send(client_ready_message("healthy"))
 
             master.start(2, 100)
             master.clients["missing"].state = STATE_MISSING
@@ -2839,7 +2873,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 run_count[0] += 1
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             master.start(7, 7)
             self.assertEqual(15, len(server.get_messages()))
@@ -2878,7 +2912,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 self.runner_stopped = True
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             master.start(7, 7)
             self.assertEqual(15, len(server.get_messages()))
@@ -2888,7 +2922,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
             self.reset_state()
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
             master.start(7, 7)
             master.stop()
             master.quit()
@@ -2917,7 +2951,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 self.runner_stopped = True
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             master.start(7, 7)
             self.assertEqual(15, len(server.get_messages()))
@@ -2964,7 +2998,7 @@ class TestMasterRunner(LocustRunnerTestCase):
             master = self.get_runner(user_classes=[TestUser])
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             master.start(7, 7)
             self.assertEqual(15, len(server.outbox))
@@ -2982,7 +3016,7 @@ class TestMasterRunner(LocustRunnerTestCase):
             master = self.get_runner(user_classes=[TestUser])
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             master.start(2, 2)
             self.assertEqual(15, len(server.outbox))
@@ -3007,7 +3041,7 @@ class TestMasterRunner(LocustRunnerTestCase):
             USERS_COUNT = 5
 
             for i in range(USERS_COUNT):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             master.start(USERS_COUNT, USERS_COUNT)
             self.assertEqual(USERS_COUNT * 3, len(server.outbox))
@@ -3043,7 +3077,7 @@ class TestMasterRunner(LocustRunnerTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[MyUser])
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             # Start the shape_worker
             self.environment.shape_class.reset_time()
@@ -3095,7 +3129,7 @@ class TestMasterRunner(LocustRunnerTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[MyUser])
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             # Start the shape_worker
             self.environment.shape_class.reset_time()
@@ -3140,7 +3174,7 @@ class TestMasterRunner(LocustRunnerTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[MyUser])
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(client_ready_message("fake_client%i" % i))
 
             # Start the shape_worker
             self.environment.shape_class.reset_time()
@@ -3235,7 +3269,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 self.assertEqual(0, len(master.clients))
                 server.mocked_send(Message("client_ready", NETWORK_BROKEN, "fake_client"))
                 self.assertTrue(master.connection_broken)
-                server.mocked_send(Message("client_ready", __version__, "fake_client"))
+                server.mocked_send(client_ready_message("fake_client"))
                 sleep(1)
                 self.assertFalse(master.connection_broken)
                 self.assertEqual(1, len(master.clients))
@@ -3244,7 +3278,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_reset_connection_after_RPCError(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc(raise_on_close=False)) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(client_ready_message("fake_client"))
             sleep(0.2)
             self.assertFalse(master.connection_broken)
             self.assertEqual(1, len(master.clients))
@@ -3270,7 +3304,7 @@ class TestMasterRunner(LocustRunnerTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[MyUser1, MyUser2])
 
-            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
+            server.mocked_send(client_ready_message("fake_client1"))
 
             master.start(7, 7)
             self.assertEqual({"MyUser1": 4, "MyUser2": 3}, master.target_user_classes_count)
@@ -3385,11 +3419,11 @@ class TestMasterRunner(LocustRunnerTestCase):
 
     def test_master_discard_first_client_ready(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
-            server.mocked_send(Message("client_ready", __version__, "dummy_client"))
+            server.mocked_send(client_ready_message("dummy_client"))
             # discard first client_ready msg
             server.queue.get()
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "dummy_client"))
+            server.mocked_send(client_ready_message("dummy_client"))
 
             messages = server.get_messages()
 
@@ -3410,7 +3444,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(client_ready_message("zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
@@ -3443,7 +3477,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(client_ready_message("zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
@@ -3466,7 +3500,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(client_ready_message("zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
@@ -3476,6 +3510,318 @@ class TestMasterRunner(LocustRunnerTestCase):
             sleep(0.1)
             server.mocked_send(Message("stats", UNRECOGNIZED_HOST_MESSAGE, "unknown_host"))
             self.assertEqual(3, len(server.get_messages()))
+
+
+class TestManifestInfrastructure(LocustTestCase):
+    def test_worker_node_defaults_to_no_quarantine_reasons(self):
+        node = WorkerNode("fake_worker")
+        self.assertEqual([], node.quarantine_reasons)
+
+    def test_worker_nodes_quarantined_filter(self):
+        nodes = WorkerNodes()
+        nodes["healthy"] = WorkerNode("healthy", state=STATE_INIT)
+        nodes["running"] = WorkerNode("running", state=STATE_RUNNING)
+        nodes["bad"] = WorkerNode("bad", state=STATE_QUARANTINED)
+        self.assertEqual(["bad"], [node.id for node in nodes.quarantined])
+        self.assertEqual(2, len(nodes.ready + nodes.running))
+
+    def test_worker_manifest_rejected_event(self):
+        environment = Environment()
+        received = []
+
+        def on_rejected(client_id, reasons, worker_manifest, reference_manifest):
+            received.append((client_id, reasons, worker_manifest, reference_manifest))
+
+        environment.events.worker_manifest_rejected.add_listener(on_rejected)
+        environment.events.worker_manifest_rejected.fire(
+            client_id="fake_worker",
+            reasons=["locustfile content differs: locustfile.py"],
+            worker_manifest={"fingerprint": "a"},
+            reference_manifest={"fingerprint": "b"},
+        )
+        self.assertEqual(1, len(received))
+        self.assertEqual("fake_worker", received[0][0])
+        self.assertIn("locustfile content differs", received[0][1][0])
+
+
+class TestManifestGate(LocustRunnerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.environment = Environment(events=locust.events, catch_exceptions=False)
+
+    def get_runner(self, user_classes=None):
+        if user_classes is not None:
+            self.environment.user_classes = user_classes
+        return self.environment.create_master_runner("*", 5557)
+
+    def _mismatching_manifest(self):
+        class GateUser(User):
+            @task
+            def do_something(self):
+                pass
+
+        return build_manifest(Environment(available_user_classes={"GateUser": GateUser}))
+
+    def test_matching_manifest_worker_is_admitted(self):
+        connect_events = []
+        reject_events = []
+        self.environment.events.worker_connect.add_listener(lambda client_id: connect_events.append(client_id))
+        self.environment.events.worker_manifest_rejected.add_listener(lambda **kwargs: reject_events.append(kwargs))
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("good_worker"))
+            sleep(0)
+
+            self.assertEqual(STATE_INIT, master.clients["good_worker"].state)
+            self.assertEqual(1, master.worker_count)
+            self.assertEqual([], master.clients["good_worker"].quarantine_reasons)
+            self.assertEqual(["good_worker"], connect_events)
+            self.assertEqual([], reject_events)
+            self.assertEqual(1, len(server.get_messages("ack")))
+            self.assertEqual(0, len(server.get_messages("manifest_rejected")))
+
+    def test_mismatching_manifest_worker_is_quarantined(self):
+        reject_events = []
+        connect_events = []
+        self.environment.events.worker_manifest_rejected.add_listener(lambda **kwargs: reject_events.append(kwargs))
+        self.environment.events.worker_connect.add_listener(lambda client_id: connect_events.append(client_id))
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("bad_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+
+            node = master.clients["bad_worker"]
+            self.assertEqual(STATE_QUARANTINED, node.state)
+            self.assertEqual(0, master.worker_count)
+            self.assertTrue(node.quarantine_reasons)
+            self.assertIn("GateUser", " ".join(node.quarantine_reasons))
+            self.assertEqual([], connect_events)
+            self.assertEqual(1, len(reject_events))
+            self.assertEqual("bad_worker", reject_events[0]["client_id"])
+            rejected_messages = server.get_messages("manifest_rejected")
+            self.assertEqual(1, len(rejected_messages))
+            self.assertEqual("bad_worker", rejected_messages[0].node_id)
+            self.assertIn("reasons", rejected_messages[0].data)
+            self.assertIn("reference_manifest", rejected_messages[0].data)
+            self.assertEqual(0, len(server.get_messages("ack")))
+
+    def test_quarantined_worker_is_not_revived_by_heartbeats(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            master._users_dispatcher = UsersDispatcher(worker_nodes=[], user_classes=[ManifestDispatcherUser])
+            server.mocked_send(client_ready_message("bad_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+
+            for _ in range(3):
+                server.mocked_send(
+                    Message(
+                        "heartbeat",
+                        {"state": "ready", "current_cpu_usage": 0, "current_memory_usage": 0},
+                        "bad_worker",
+                    )
+                )
+                sleep(0)
+
+            self.assertEqual(STATE_QUARANTINED, master.clients["bad_worker"].state)
+            self.assertEqual([], list(master._users_dispatcher._worker_nodes))
+            self.assertEqual(0, master.worker_count)
+
+    def test_quarantined_worker_spawning_messages_are_ignored(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("bad_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+            server.mocked_send(Message("spawning", None, "bad_worker"))
+            server.mocked_send(
+                Message(
+                    "spawning_complete",
+                    {"user_classes_count": {"GateUser": 3}},
+                    "bad_worker",
+                )
+            )
+            sleep(0)
+
+            node = master.clients["bad_worker"]
+            self.assertEqual(STATE_QUARANTINED, node.state)
+            self.assertEqual({}, node.user_classes_count)
+
+    def test_reference_manifest_is_built_once_and_cached(self):
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            mock.patch("locust.runners.build_manifest", wraps=build_manifest) as build_spy,
+        ):
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("worker1"))
+            server.mocked_send(client_ready_message("worker2"))
+            server.mocked_send(client_ready_message("worker3"))
+            sleep(0)
+            self.assertEqual(3, master.worker_count)
+            self.assertEqual(1, build_spy.call_count)
+            # the same cached instance is returned in the rejection payload too
+            self.assertIs(master.reference_manifest, master.reference_manifest)
+
+    def test_dead_quarantined_worker_is_cleaned_up_without_dispatch_changes(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc(raise_on_close=False)) as server:
+            master = self.get_runner()
+            master._users_dispatcher = UsersDispatcher(worker_nodes=[], user_classes=[ManifestDispatcherUser])
+            server.mocked_send(client_ready_message("bad_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+            master.clients["bad_worker"].heartbeat = HEARTBEAT_DEAD_INTERNAL
+            sleep(HEARTBEAT_INTERVAL + 0.2)
+
+            self.assertNotIn("bad_worker", master.clients)
+            self.assertEqual([], list(master._users_dispatcher._worker_nodes))
+
+    def test_quarantined_worker_is_readmitted_when_reconnecting_with_matching_manifest(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("flickering_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+            self.assertEqual(STATE_QUARANTINED, master.clients["flickering_worker"].state)
+
+            # same client id reconnects after the locustfile was fixed
+            server.outbox.clear()
+            server.mocked_send(client_ready_message("flickering_worker"))
+            sleep(0)
+
+            node = master.clients["flickering_worker"]
+            self.assertEqual(STATE_INIT, node.state)
+            self.assertEqual([], node.quarantine_reasons)
+            self.assertEqual(1, master.worker_count)
+            self.assertEqual(1, len(server.get_messages("ack")))
+
+    def test_duplicate_ready_from_healthy_worker_does_not_duplicate_pool(self):
+        connect_events = []
+        self.environment.events.worker_connect.add_listener(lambda client_id: connect_events.append(client_id))
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            master._users_dispatcher = UsersDispatcher(
+                worker_nodes=[], user_classes=[ManifestDispatcherUser]
+            )
+            server.mocked_send(client_ready_message("flickering_worker"))
+            sleep(0)
+            # the worker resets its ZMQ connection and resends client_ready while still healthy
+            server.mocked_send(client_ready_message("flickering_worker"))
+            sleep(0)
+
+            nodes = list(master._users_dispatcher._worker_nodes)
+            self.assertEqual(1, len(nodes))
+            self.assertEqual("flickering_worker", nodes[0].id)
+            self.assertEqual(1, master.worker_count)
+            self.assertEqual(["flickering_worker"], connect_events)
+            self.assertEqual(2, len(server.get_messages("ack")))
+
+    def test_quarantined_then_readmitted_worker_rejoins_dispatcher(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            master._users_dispatcher = UsersDispatcher(
+                worker_nodes=[], user_classes=[ManifestDispatcherUser]
+            )
+            server.mocked_send(
+                client_ready_message("flickering_worker", manifest=self._mismatching_manifest())
+            )
+            sleep(0)
+            self.assertEqual([], list(master._users_dispatcher._worker_nodes))
+
+            server.mocked_send(client_ready_message("flickering_worker"))
+            sleep(0)
+            nodes = list(master._users_dispatcher._worker_nodes)
+            self.assertEqual(1, len(nodes))
+            self.assertEqual("flickering_worker", nodes[0].id)
+            self.assertEqual(STATE_INIT, master.clients["flickering_worker"].state)
+
+    def test_repeated_mismatching_ready_does_not_admit_or_join_dispatcher(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            master._users_dispatcher = UsersDispatcher(worker_nodes=[], user_classes=[ManifestDispatcherUser])
+            for _ in range(2):
+                server.mocked_send(client_ready_message("bad_worker", manifest=self._mismatching_manifest()))
+                sleep(0)
+
+            self.assertEqual(STATE_QUARANTINED, master.clients["bad_worker"].state)
+            self.assertEqual([], list(master._users_dispatcher._worker_nodes))
+            self.assertEqual(2, len(server.get_messages("manifest_rejected")))
+            self.assertEqual(0, len(server.get_messages("ack")))
+
+
+class TestManifestStartGate(LocustRunnerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.environment = Environment(
+            events=locust.events, catch_exceptions=False, user_classes=[ManifestDispatcherUser]
+        )
+        self.matching_manifest = build_manifest(self.environment)
+
+    def get_runner(self):
+        return self.environment.create_master_runner("*", 5557)
+
+    def _mismatching_manifest(self):
+        class StartGateUser(User):
+            @task
+            def do_something(self):
+                pass
+
+        return build_manifest(Environment(available_user_classes={"StartGateUser": StartGateUser}))
+
+    def test_start_refuses_when_all_workers_are_quarantined(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("bad_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+
+            master.start(user_count=1, spawn_rate=1)
+
+            self.assertEqual(STATE_INIT, master.state)
+            self.assertEqual(0, len(server.get_messages("spawn")))
+            self.assertTrue(
+                any("quarantined" in line for line in self.mocked_log.warning),
+                "Starting with only quarantined workers must log a clear warning",
+            )
+
+    def test_start_dispatches_only_to_healthy_workers(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("good_worker", manifest=self.matching_manifest))
+            server.mocked_send(client_ready_message("bad_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+
+            master.start(user_count=1, spawn_rate=1)
+
+            spawn_targets = [m.node_id for m in server.get_messages("spawn")]
+            self.assertEqual(["good_worker"], spawn_targets)
+            self.assertTrue(any("1 healthy worker" in line and "1 worker" in line for line in self.mocked_log.info))
+
+    def test_hotjoin_with_mismatching_manifest_does_not_change_dispatch(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("good_worker", manifest=self.matching_manifest))
+            sleep(0)
+            master.start(user_count=3, spawn_rate=1)
+            self.assertEqual(["good_worker"], [n.id for n in master._users_dispatcher._worker_nodes])
+
+            # a mismatching worker connects in the middle of the run
+            server.mocked_send(client_ready_message("late_bad_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+
+            self.assertEqual(["good_worker"], [n.id for n in master._users_dispatcher._worker_nodes])
+            self.assertEqual(3, master.target_user_count)
+            spawn_targets = [m.node_id for m in server.get_messages("spawn")]
+            self.assertTrue(spawn_targets)
+            self.assertTrue(all(target == "good_worker" for target in spawn_targets))
+            self.assertNotIn("late_bad_worker", spawn_targets)
+
+    def test_check_stopped_ignores_quarantined_workers(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(client_ready_message("good_worker", manifest=self.matching_manifest))
+            server.mocked_send(client_ready_message("bad_worker", manifest=self._mismatching_manifest()))
+            sleep(0)
+
+            master.update_state(STATE_STOPPING)
+            master.clients["good_worker"].state = STATE_INIT
+            master.check_stopped()
+
+            self.assertEqual(STATE_STOPPED, master.state)
 
 
 class TestWorkerRunner(LocustTestCase):
@@ -3495,6 +3841,96 @@ class TestWorkerRunner(LocustTestCase):
         user_classes = user_classes or []
         environment.user_classes = user_classes
         return WorkerRunner(environment, master_host="localhost", master_port=5557)
+
+    def test_client_ready_carries_manifest(self):
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            worker = self.get_runner(environment=Environment(), client=client)
+            ready_messages = client.get_messages("client_ready")
+            self.assertEqual(1, len(ready_messages))
+            data = ready_messages[0].data
+            self.assertIsInstance(data, dict)
+            self.assertEqual(__version__, data["version"])
+            self.assertEqual("locust-execution-manifest", data["manifest"]["kind"])
+            self.assertTrue(data["manifest"]["fingerprint"])
+            self.assertEqual(build_manifest(worker.environment), data["manifest"])
+
+    def test_manifest_rejected_quarantines_worker_but_keeps_it_alive(self):
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            client.mocked_send(
+                Message(
+                    "manifest_rejected",
+                    {
+                        "reasons": ["user class weight differs: MyUser"],
+                        "reference_manifest": {},
+                        "worker_manifest": {},
+                    },
+                    "dummy_client_id",
+                )
+            )
+            environment = Environment()
+            environment.user_classes = []
+            worker = WorkerRunner(environment, master_host="localhost", master_port=5557)
+            sleep(0)
+
+            self.assertTrue(worker.quarantined)
+            self.assertEqual(STATE_QUARANTINED, worker.worker_state)
+            self.assertEqual(["user class weight differs: MyUser"], worker.quarantine_reasons)
+            # connect_to_master must return normally (keepalive), not retry in a loop
+            self.assertTrue(worker.connected)
+
+            # spawn messages while quarantined are ignored
+            client.mocked_send(
+                Message(
+                    "spawn",
+                    {
+                        "timestamp": 1605538584,
+                        "user_classes_count": {"MyUser": 1},
+                        "host": "",
+                        "stop_timeout": None,
+                        "parsed_options": {},
+                    },
+                    "dummy_client_id",
+                )
+            )
+            sleep(0)
+            self.assertEqual(0, len(client.get_messages("spawning")))
+            self.assertEqual(STATE_QUARANTINED, worker.worker_state)
+
+    def test_strict_manifest_exits_on_rejection(self):
+        options = get_parser().parse_args(["--strict-manifest"])
+        with (
+            mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client,
+            mock.patch("locust.runners.sys.exit", side_effect=SystemExit(1)) as exit_mock,
+        ):
+            environment = Environment(parsed_options=options)
+            worker = self.get_runner(environment=environment, client=client)
+            with self.assertRaises(SystemExit):
+                worker.handle_message(
+                    Message("manifest_rejected", {"reasons": ["version prefix differs"]}, "dummy_client_id")
+                )
+            exit_mock.assert_called_once_with(1)
+
+    def test_worker_is_readmitted_after_ack(self):
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            worker = self.get_runner(environment=Environment(), client=client)
+            client.mocked_send(Message("manifest_rejected", {"reasons": ["files content differs"]}, "dummy_client_id"))
+            sleep(0)
+            self.assertTrue(worker.quarantined)
+
+            client.mocked_send(Message("ack", {"index": 0}, "dummy_client_id"))
+            sleep(0)
+            self.assertFalse(worker.quarantined)
+            self.assertEqual([], worker.quarantine_reasons)
+            self.assertEqual(STATE_INIT, worker.worker_state)
+
+    def test_reset_connection_resends_client_ready_with_manifest(self):
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc(raise_on_close=False)) as client:
+            worker = self.get_runner(environment=Environment(), client=client)
+            client.outbox.clear()
+            worker.reset_connection()
+            ready_messages = client.get_messages("client_ready")
+            self.assertEqual(1, len(ready_messages))
+            self.assertEqual("locust-execution-manifest", ready_messages[0].data["manifest"]["kind"])
 
     def test_worker_stop_timeout(self):
         class MyTestUser(User):

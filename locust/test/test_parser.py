@@ -13,7 +13,7 @@ from unittest import mock
 
 from .mock_locustfile import mock_locustfile
 from .testcases import LocustTestCase
-from .util import get_locustfiles_from_args
+from .util import get_locustfiles_from_args, patch_env
 
 
 class TestParser(unittest.TestCase):
@@ -34,6 +34,22 @@ class TestParser(unittest.TestCase):
         args = ["--skip-log-setup"]
         opts = self.parser.parse_args(args)
         self.assertEqual(opts.skip_log_setup, True)
+
+    def test_manifest_consistency_options_default(self):
+        opts = self.parser.parse_args([])
+        self.assertFalse(opts.allow_legacy_workers)
+        self.assertFalse(opts.strict_manifest)
+
+    def test_manifest_consistency_options_flags(self):
+        opts = self.parser.parse_args(["--allow-legacy-workers", "--strict-manifest"])
+        self.assertTrue(opts.allow_legacy_workers)
+        self.assertTrue(opts.strict_manifest)
+
+    def test_manifest_consistency_options_env(self):
+        with patch_env("LOCUST_ALLOW_LEGACY_WORKERS", "true"), patch_env("LOCUST_STRICT_MANIFEST", "true"):
+            opts = get_parser(default_config_files=[]).parse_args([])
+        self.assertTrue(opts.allow_legacy_workers)
+        self.assertTrue(opts.strict_manifest)
 
     def test_parse_options_from_conf_file(self):
         with NamedTemporaryFile(mode="w", suffix=".conf") as file:

@@ -94,6 +94,57 @@ listen to. Defaults to 5557.
 Used when starting the master node with ``--headless``. The master node will then wait until X worker
 nodes has connected before the test is started.
 
+Verifying a consistent execution manifest
+==========================================
+
+In a distributed run, a worker that accidentally runs a different locustfile, different User class
+definitions (name, weight or fixed count), a different LoadTestShape, or an incompatible Locust
+version would generate traffic that silently differs from the other workers. To prevent this, every
+worker sends an *execution manifest* together with its ``client_ready`` handshake. The manifest
+contains:
+
+* a SHA-256 hash of every Python source file the master's (and worker's) User/Shape classes were
+  loaded from (dynamic classes defined in a REPL or notebook fall back to a hash of their source
+  code/bytecode),
+* the name, weight and fixed_count of every User class,
+* the selected LoadTestShape class name,
+* and the master/worker Locust version prefix.
+
+Runtime settings that the master distributes to workers in the spawn message (``--host``, tags, user
+counts, spawn rate, custom arguments, etc.) are intentionally **not** part of the manifest.
+
+The master compares each connecting worker's manifest against its own reference manifest before
+admitting it. The check is applied on initial startup, on reconnects and when workers join a test
+that is already running (hot-join).
+
+A worker whose manifest doesn't match is **quarantined**:
+
+* it never enters the worker pool, receives no spawn messages and cannot generate any traffic,
+* it stays connected and visible (state ``quarantined``) in the Workers table of the Web UI, where a
+  red badge lists the concrete differences (the same details are emitted as error logs on the master
+  and the worker),
+* the healthy workers keep running normally on the shared, verified definition. When starting a run,
+  the master logs how many healthy versus quarantined workers there are; if all workers are
+  quarantined the run refuses to start.
+
+A quarantined worker is re-admitted automatically when it reconnects with a matching manifest (for
+example after its locustfile has been corrected and the process has been restarted).
+
+``--allow-legacy-workers`` (master)
+-----------------------------------
+
+Workers that don't send a manifest (Locust versions older than this feature) are quarantined by
+default. Start the master with ``--allow-legacy-workers`` (env var
+``LOCUST_ALLOW_LEGACY_WORKERS``) to let them join anyway; a prominent warning is logged because
+their traffic cannot be verified to match the master's locustfile.
+
+``--strict-manifest`` (worker)
+------------------------------
+
+By default a quarantined worker stays alive but idle so it can be inspected and re-join once fixed.
+Start a worker with ``--strict-manifest`` (env var ``LOCUST_STRICT_MANIFEST``) to make it exit with a
+non-zero status code instead, which is useful for failing fast in CI/CD or orchestrated deployments.
+
 Communicating across nodes
 =============================================
 

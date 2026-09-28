@@ -673,6 +673,18 @@ def setup_parser_arguments(parser):
         help="Re-distribute users if new workers are added or removed during a test run. Experimental.",
     )
     master_group.add_argument(
+        "--allow-legacy-workers",
+        action="store_true",
+        default=False,
+        dest="allow_legacy_workers",
+        help=(
+            "Allow workers that do not report an execution manifest (pre manifest-consistency versions) to join. "
+            "Their traffic cannot be guaranteed to match the master's locustfile and a warning is logged. "
+            "By default such workers are quarantined."
+        ),
+        env_var="LOCUST_ALLOW_LEGACY_WORKERS",
+    )
+    master_group.add_argument(
         "--expect-slaves",
         action=raise_argument_type_error("The --expect-slaves parameter has been renamed --expect-workers"),
         nargs=0,
@@ -717,6 +729,17 @@ Typically ONLY these options (and --locustfile) need to be specified on workers,
         default=5557,
         help="Port to connect to on master node. Defaults to 5557.",
         env_var="LOCUST_MASTER_NODE_PORT",
+    )
+    worker_group.add_argument(
+        "--strict-manifest",
+        action="store_true",
+        default=False,
+        dest="strict_manifest",
+        help=(
+            "Exit with a non-zero code if the master rejects this worker's execution manifest, "
+            "instead of staying connected in an idle, quarantined state. Useful for CI/k8s crash-loop setups."
+        ),
+        env_var="LOCUST_STRICT_MANIFEST",
     )
 
     web_ui_group.add_argument(

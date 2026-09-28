@@ -11,6 +11,7 @@ export const SWARM_STATE = {
   CLEANUP: 'cleanup',
   STOPPING: 'stopping',
   MISSING: 'missing',
+  QUARANTINED: 'quarantined',
 };
 
 export const swarmTemplateArgs = window.templateArgs

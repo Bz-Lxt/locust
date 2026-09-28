@@ -66,6 +66,7 @@ export interface ISwarmState {
   users: { [key: string]: ISwarmUser };
   version: string;
   workerCount: number;
+  quarantinedWorkerCount?: number;
   profile?: string;
   allProfiles?: string[];
 }
