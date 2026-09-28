@@ -615,7 +615,7 @@ class TestCsvStats(LocustTestCase):
             greenlet = gevent.spawn(stats_writer)
             gevent.sleep(_TEST_CSV_STATS_INTERVAL_WAIT_SEC)
 
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
 
             master.stats.entries[("/", "GET")].log(100, 23455)
             master.stats.entries[("/", "GET")].log(800, 23455)
@@ -687,7 +687,7 @@ class TestCsvStats(LocustTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             environment = Environment()
             master = environment.create_master_runner(master_bind_host="*", master_bind_port=0)
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
 
             request_name_dict = {
                 "scenario": "get cashes",

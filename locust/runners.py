@@ -14,7 +14,7 @@ import time
 import traceback
 from abc import abstractmethod
 from collections import defaultdict
-from collections.abc import Callable, Iterator, MutableMapping, ValuesView
+from collections.abc import Callable, Collection, Iterator, MutableMapping, ValuesView
 from operator import itemgetter, methodcaller
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
@@ -61,6 +61,195 @@ MASTER_HEARTBEAT_TIMEOUT = 60
 FALLBACK_INTERVAL = 5
 CONNECT_TIMEOUT = 5
 CONNECT_RETRY_COUNT = 60
+
+# Result states of a cluster-wide command (one generation of master intent)
+COMMAND_PENDING, COMMAND_CONFIRMED, COMMAND_TIMEOUT, COMMAND_SUPERSEDED = [
+    "pending",
+    "confirmed",
+    "timeout",
+    "superseded",
+]
+COMMAND_TERMINAL_STATES = {COMMAND_CONFIRMED, COMMAND_TIMEOUT, COMMAND_SUPERSEDED}
+
+# Master intents that are totally ordered by the generation counter
+INTENT_SPAWN, INTENT_STOP, INTENT_QUIT = ["spawn", "stop", "quit"]
+
+
+def canonical_spawn_target(
+    user_count: int, spawn_rate: float, user_classes: list[type[User]] | None
+) -> tuple[Any, ...]:
+    """
+    A hashable fingerprint of a spawn intent. Two spawn calls with the same fingerprint
+    express the same cluster intent and therefore reuse the current generation.
+    """
+    class_names = tuple(sorted(user_class.__name__ for user_class in user_classes)) if user_classes else ()
+    return (user_count, spawn_rate, class_names)
+
+
+class ClusterCommandResult:
+    """
+    The confirmable outcome of one generation of master intent.
+
+    The result stays ``pending`` until every expected worker has acknowledged the
+    generation, it times out while workers are missing, or a newer generation
+    supersedes it. Terminal transitions happen at most once and wake up all waiters.
+    """
+
+    def __init__(
+        self,
+        generation: int,
+        intent: str,
+        target: Any = None,
+        expected_workers: Collection[str] | None = None,
+        on_terminal: Callable[[ClusterCommandResult], None] | None = None,
+    ) -> None:
+        self.generation = generation
+        self.intent = intent
+        self.target = target
+        self.expected_workers: set[str] = set(expected_workers or ())
+        self.acked_workers: set[str] = set()
+        self.ack_payloads: dict[str, Any] = {}
+        self.status: str = COMMAND_PENDING
+        self.missing_snapshot: set[str] = set()
+        self._on_terminal = on_terminal
+        self._completed_event = Event()
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in COMMAND_TERMINAL_STATES
+
+    @property
+    def missing_workers(self) -> set[str]:
+        if self.is_terminal:
+            return set(self.missing_snapshot)
+        return self.expected_workers - self.acked_workers
+
+    @property
+    def confirmed(self) -> bool:
+        return self.status == COMMAND_CONFIRMED
+
+    def wait(self, timeout: float | None = None) -> ClusterCommandResult:
+        self._completed_event.wait(timeout=timeout)
+        return self
+
+    def expect(self, worker_id: str) -> None:
+        """Add a worker to the set that must acknowledge this generation."""
+        if not self.is_terminal:
+            self.expected_workers.add(worker_id)
+
+    def drop_expected(self, worker_id: str) -> None:
+        """A worker vanished (marked missing/removed); it can no longer acknowledge."""
+        self.expected_workers.discard(worker_id)
+        self.acked_workers.discard(worker_id)
+        self.ack_payloads.pop(worker_id, None)
+        self._maybe_confirm()
+
+    def ack(self, worker_id: str, payload: Any = None) -> bool:
+        """Record a worker acknowledgement. Returns True if this completed the result."""
+        if self.is_terminal:
+            return False
+        self.acked_workers.add(worker_id)
+        if payload is not None:
+            self.ack_payloads[worker_id] = payload
+        return self._maybe_confirm()
+
+    def _maybe_confirm(self) -> bool:
+        # An empty expected set must not count as confirmed: a generation that lost all
+        # workers is either superseded (a stop generation follows) or times out.
+        if self.expected_workers and self.expected_workers <= self.acked_workers:
+            self.finish(COMMAND_CONFIRMED)
+            return True
+        return False
+
+    def finish(self, status: str, missing: Collection[str] | None = None) -> bool:
+        if self.is_terminal:
+            return False
+        assert status in COMMAND_TERMINAL_STATES
+        self.status = status
+        self.missing_snapshot = set(missing if missing is not None else self.expected_workers - self.acked_workers)
+        if self._on_terminal is not None:
+            self._on_terminal(self)
+        self._completed_event.set()
+        return True
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "generation": self.generation,
+            "intent": self.intent,
+            "status": self.status,
+            "expected_workers": set(self.expected_workers),
+            "acked_workers": set(self.acked_workers),
+            "missing_workers": self.missing_workers,
+        }
+
+    def __repr__(self) -> str:
+        return f"<ClusterCommandResult gen={self.generation} {self.intent} {self.status}>"
+
+
+class ClusterCommandLedger:
+    """
+    Master-side bookkeeping of the totally ordered cluster intent generations.
+
+    Only the latest generation is expected to converge cluster-wide. Submitting the
+    same intent+target while it is still pending coalesces onto the pending result;
+    submitting it after it went terminal (rebalance / reconnect re-dispatch) opens a
+    new result while reusing the generation number; any different intent/target
+    allocates a new generation and supersedes the pending one.
+    """
+
+    def __init__(self, on_terminal: Callable[[ClusterCommandResult], None] | None = None) -> None:
+        self.generation: int = 0
+        self.current: ClusterCommandResult | None = None
+        self.intent: str | None = None
+        self.target: Any = None
+        self._on_terminal = on_terminal
+
+    def submit(
+        self,
+        intent: str,
+        target: Any = None,
+        expected_workers: Collection[str] | None = None,
+    ) -> ClusterCommandResult:
+        if self.current is not None and not self.current.is_terminal:
+            if self.current.intent == intent and self.current.target == target:
+                # Same intent dispatched again while in flight (concurrent call): coalesce.
+                for worker_id in expected_workers or ():
+                    self.current.expect(worker_id)
+                return self.current
+            self.current.finish(COMMAND_SUPERSEDED)
+
+        same_intent = self.current is not None and self.intent == intent and self.target == target
+        if not same_intent:
+            self.generation += 1
+            self.intent = intent
+            self.target = target
+
+        result = ClusterCommandResult(
+            self.generation, intent, target, expected_workers=expected_workers, on_terminal=self._on_terminal
+        )
+        self.current = result
+        return result
+
+    def observe_ack(self, worker_id: str, generation: int, payload: Any = None) -> ClusterCommandResult | None:
+        """
+        Route an acknowledgement carrying a generation. Acks for anything but the
+        current result are ignored (callers may treat them as stale information).
+        """
+        if self.current is None or generation != self.current.generation or self.current.is_terminal:
+            return None
+        self.current.ack(worker_id, payload)
+        return self.current
+
+    def expect_worker(self, worker_id: str) -> None:
+        if self.current is not None and not self.current.is_terminal:
+            self.current.expect(worker_id)
+
+    def drop_worker(self, worker_id: str) -> None:
+        if self.current is not None and not self.current.is_terminal:
+            self.current.drop_expected(worker_id)
+
+    def is_current(self, generation: int) -> bool:
+        return self.current is not None and self.current.generation == generation
 
 
 def locust_exception_handler(environment: Environment):
@@ -121,6 +310,12 @@ class Runner:
         self.custom_messages: dict[str, tuple[Callable, bool]] = {}
 
         self._users_dispatcher: UsersDispatcher | None = None
+
+        # Serializes intent submission (start/stop/quit). The lock is only held while
+        # state transitions, ledger submissions and command dispatch setup happen;
+        # cluster convergence waits occur outside the lock so a newer intent can
+        # supersede one that is still waiting for acknowledgements.
+        self._command_lock = gevent.lock.RLock()
 
         # set up event listeners for recording requests
         def on_request(request_type, name, response_time, response_length, exception=None, **_kwargs):
@@ -316,7 +511,7 @@ class Runner:
     @abstractmethod
     def start(
         self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list[type[User]] | None = None
-    ) -> None: ...
+    ) -> ClusterCommandResult | None: ...
 
     @abstractmethod
     def send_message(self, msg_type: str, data: Any = None, client_id: str | None = None) -> None: ...
@@ -375,12 +570,18 @@ class Runner:
             shape_adjustment_time_ms = time.time() - shape_adjustment_start
             gevent.sleep(max(1 - shape_adjustment_time_ms, 0))
 
-    def stop(self) -> None:
+    def stop(self, send_stop_to_client: bool = True) -> ClusterCommandResult | None:
         """
-        Stop a running load test by stopping all running users
+        Stop a running load test by stopping all running users.
+
+        ``send_stop_to_client`` is only meaningful for the distributed master; the
+        base/local implementation ignores it. Returns the cluster command result
+        for distributed runners, ``None`` locally until the result is wired up.
         """
-        if self.state == STATE_STOPPED:
-            return
+        if self.state in (STATE_STOPPED, STATE_STOPPING, STATE_CLEANUP):
+            # Re-entrant/concurrent call while a stop is already in progress:
+            # never fire test_stopping/test_stop a second time.
+            return None
         try:
             caller = inspect.getframeinfo(inspect.stack()[1][0])
             logger.debug(f"Stopping all users (called from {caller.filename}:{caller.lineno})")
@@ -410,6 +611,7 @@ class Runner:
 
         self.cpu_log_warning()
         self.environment.events.test_stop.fire(environment=self.environment)
+        return None
 
     def quit(self) -> None:
         """
@@ -546,24 +748,28 @@ class LocalRunner(Runner):
 
     def start(
         self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list[type[User]] | None = None
-    ) -> None:
+    ) -> ClusterCommandResult | None:
         if spawn_rate > 100:
             logger.warning(
                 "Your selected spawn rate is very high (>100), and this is known to sometimes cause issues. Do you really need to ramp up that fast?"
             )
 
-        if self.spawning_greenlet:
-            # kill existing spawning_greenlet before we start a new one
-            self.spawning_greenlet.kill(block=True)
-        self.spawning_greenlet = self.greenlet.spawn(
-            lambda: self._start(user_count, spawn_rate, wait=wait, user_classes=user_classes)
-        )
-        self.spawning_greenlet.link_exception(locust_exception_handler(self.environment))
+        with self._command_lock:
+            if self.spawning_greenlet:
+                # kill existing spawning_greenlet before we start a new one
+                self.spawning_greenlet.kill(block=True)
+            self.spawning_greenlet = self.greenlet.spawn(
+                lambda: self._start(user_count, spawn_rate, wait=wait, user_classes=user_classes)
+            )
+            self.spawning_greenlet.link_exception(locust_exception_handler(self.environment))
+        return None
 
-    def stop(self) -> None:
-        if self.state == STATE_STOPPED:
-            return
-        super().stop()
+    def stop(self, send_stop_to_client: bool = True) -> ClusterCommandResult | None:
+        with self._command_lock:
+            if self.state in (STATE_STOPPED, STATE_STOPPING, STATE_CLEANUP):
+                return None
+            super().stop()
+        return None
 
     def send_message(self, msg_type: str, data: Any = None, client_id: str | None = None) -> None:
         """
@@ -597,6 +803,10 @@ class WorkerNode:
         self.memory_usage: int = 0
         # The reported users running on the worker
         self.user_classes_count: dict[str, int] = {}
+        # Highest command generation the worker reported to have seen/applied
+        self.last_generation: int = -1
+        # Last per-worker user target dispatched to this worker
+        self.last_target: dict[str, int] = {}
 
     @property
     def user_count(self) -> int:
@@ -646,6 +856,23 @@ class WorkerNodes(MutableMapping):
         return iter(list(self._worker_nodes.keys()))
 
 
+def parse_client_ready_data(data: Any) -> tuple[Any, int, str | None]:
+    """
+    Parse a worker's client_ready handshake payload.
+
+    New workers send ``{"version": ..., "generation": <watermark>, "state": ...}``.
+    Legacy payloads (a bare version string/int/None) return version ``None`` so the
+    master can reject them: the cluster command generation protocol is mandatory.
+    """
+    if isinstance(data, dict) and "version" in data:
+        return data["version"], int(data.get("generation", -1)), data.get("state")
+    return None, -1, None
+
+
+def make_client_ready_data(version: str, generation: int, state: str) -> dict[str, Any]:
+    return {"version": version, "generation": generation, "state": state}
+
+
 class MasterRunner(DistributedRunner):
     """
     Runner used to run distributed load tests across multiple processes and/or machines.
@@ -687,6 +914,10 @@ class MasterRunner(DistributedRunner):
                 raise
 
         self._users_dispatcher: UsersDispatcher | None = None
+        # Totally ordered generations of cluster intent and their confirmable results
+        self._command_ledger = ClusterCommandLedger(on_terminal=self._on_command_result_terminal)
+        # The result of the latest submitted cluster command
+        self.last_command_result: ClusterCommandResult | None = None
 
         self.greenlet.spawn(self.heartbeat_worker).link_exception(locust_exception_handler(self.environment))
         self.greenlet.spawn(self.client_listener).link_exception(locust_exception_handler(self.environment))
@@ -710,6 +941,91 @@ class MasterRunner(DistributedRunner):
         return self.environment.parsed_options is not None and cast(
             bool, self.environment.parsed_options.enable_rebalancing
         )
+
+    def _on_command_result_terminal(self, result: ClusterCommandResult) -> None:
+        if result.status == COMMAND_TIMEOUT:
+            logger.warning(
+                "Timed out waiting for workers to confirm generation %i (%s), missing workers: %s",
+                result.generation,
+                result.intent,
+                sorted(result.missing_workers),
+            )
+        elif result.status == COMMAND_SUPERSEDED:
+            logger.debug(
+                "Generation %i (%s) was superseded before all workers confirmed it",
+                result.generation,
+                result.intent,
+            )
+        else:
+            logger.debug("Generation %i (%s) confirmed by all workers", result.generation, result.intent)
+
+    def _handshake_ack_data(self, client_id: str) -> dict[str, Any]:
+        ledger = self._command_ledger
+        return {
+            "index": self.get_worker_index(client_id),
+            "generation": ledger.generation,
+            "intent": ledger.intent,
+            "target": ledger.target if ledger.intent == INTENT_SPAWN else None,
+        }
+
+    def _spawn_payload(self, worker_user_classes_count: dict[str, int], generation: int) -> dict[str, Any]:
+        return {
+            "timestamp": time.time(),
+            "generation": generation,
+            "user_classes_count": worker_user_classes_count,
+            "host": self.environment.host,
+            "stop_timeout": self.environment.stop_timeout,
+            "parsed_options": vars(self.environment.parsed_options) if self.environment.parsed_options else {},
+        }
+
+    def _send_spawn_to_worker(
+        self, client_id: str, worker_user_classes_count: dict[str, int], generation: int
+    ) -> None:
+        self.server.send_to_client(
+            Message("spawn", self._spawn_payload(worker_user_classes_count, generation), client_id)
+        )
+        if client_id in self.clients:
+            # Record what we last dispatched to this node. Its applied watermark
+            # (last_generation) is only advanced by worker-originated evidence
+            # (ack/heartbeat/client_ready), so that command_stale can trigger a resend.
+            self.clients[client_id].last_target = dict(worker_user_classes_count)
+
+    def _resync_worker(self, client_id: str) -> None:
+        """
+        Re-drive a single stale/reconnected worker to the current cluster intent.
+        Workers apply every intent idempotently per generation, so resending the
+        current command is always safe.
+        """
+        if client_id not in self.clients:
+            return
+        ledger = self._command_ledger
+        node = self.clients[client_id]
+        if node.last_generation >= ledger.generation and ledger.current is not None:
+            # The worker is at the current generation but answered an old one; nothing to send.
+            return
+        self._command_ledger.expect_worker(client_id)
+        if ledger.intent == INTENT_SPAWN:
+            if node.last_target:
+                logger.debug(
+                    "Re-dispatching current spawn (generation %i) to stale worker %s", ledger.generation, client_id
+                )
+                self._send_spawn_to_worker(client_id, node.last_target, ledger.generation)
+            else:
+                # We do not know this worker's slice: a full coalesced re-dispatch rebuilds it.
+                logger.debug(
+                    "Triggering a full re-dispatch to reconcile worker %s with generation %i",
+                    client_id,
+                    ledger.generation,
+                )
+                self.greenlet.spawn(self.start, self.target_user_count, self.spawn_rate).link_exception(
+                    locust_exception_handler(self.environment)
+                )
+        elif ledger.intent == INTENT_STOP:
+            logger.debug("Re-sending current stop (generation %i) to stale worker %s", ledger.generation, client_id)
+            self.server.send_to_client(Message("stop", {"generation": ledger.generation}, client_id))
+        elif ledger.intent == INTENT_QUIT:
+            logger.debug("Re-sending current quit (generation %i) to stale worker %s", ledger.generation, client_id)
+            self.server.send_to_client(Message("quit", {"generation": ledger.generation}, client_id))
 
     def get_worker_index(self, client_id):
         """
@@ -737,71 +1053,116 @@ class MasterRunner(DistributedRunner):
 
     def start(
         self, user_count: int, spawn_rate: float, wait=False, user_classes: list[type[User]] | None = None
-    ) -> None:
+    ) -> ClusterCommandResult | None:
         self.spawning_completed = False
 
         self.target_user_count = user_count
 
-        active_workers = self.clients.ready + self.clients.running + self.clients.spawning
-        num_workers = len(active_workers)
-        if not num_workers:
-            logger.warning("You can't start a distributed test before at least one worker processes has connected")
-            return
+        # Serialized submission section: worker-set computation, ledger submission,
+        # lifecycle gating and dispatcher (re)arm are atomic with respect to concurrent
+        # start/stop/quit calls. The convergence wait happens below, outside the lock, so
+        # a newer intent can still supersede this one while it is unconfirmed.
+        with self._command_lock:
+            active_workers = self.clients.ready + self.clients.running + self.clients.spawning
+            num_workers = len(active_workers)
+            if not num_workers:
+                logger.warning(
+                    "You can't start a distributed test before at least one worker processes has connected"
+                )
+                return None
 
-        for user_class in self.user_classes:
-            if self.environment.host:
-                user_class.host = self.environment.host
+            for user_class in self.user_classes:
+                if self.environment.host:
+                    user_class.host = self.environment.host
 
-        self.spawn_rate = spawn_rate
+            self.spawn_rate = spawn_rate
 
-        if self._users_dispatcher is None:
-            self._users_dispatcher = self.environment.dispatcher_class(
-                worker_nodes=active_workers, user_classes=self.user_classes
+            if self._users_dispatcher is None:
+                self._users_dispatcher = self.environment.dispatcher_class(
+                    worker_nodes=active_workers, user_classes=self.user_classes
+                )
+
+            logger.info(
+                "Sending spawn jobs of %d users at %.2f spawn rate to %d ready workers"
+                % (user_count, spawn_rate, num_workers)
             )
 
-        logger.info(
-            "Sending spawn jobs of %d users at %.2f spawn rate to %d ready workers"
-            % (user_count, spawn_rate, num_workers)
-        )
+            worker_spawn_rate = float(spawn_rate) / (num_workers or 1)
+            if worker_spawn_rate > 100:
+                logger.warning(
+                    "Your selected spawn rate is very high (>100/worker), and this is known to sometimes cause issues. Do you really need to ramp up that fast?"
+                )
 
-        worker_spawn_rate = float(spawn_rate) / (num_workers or 1)
-        if worker_spawn_rate > 100:
-            logger.warning(
-                "Your selected spawn rate is very high (>100/worker), and this is known to sometimes cause issues. Do you really need to ramp up that fast?"
+            target = canonical_spawn_target(user_count, spawn_rate, user_classes)
+            current = self._command_ledger.current
+            coalesced = (
+                current is not None
+                and not current.is_terminal
+                and current.intent == INTENT_SPAWN
+                and current.target == target
             )
+            if coalesced:
+                # An identical spawn intent is already in flight (e.g. a concurrent /swarm
+                # call or a rebalance triggered while dispatching): join its result instead
+                # of dispatching a competing generation, and re-drive any worker not acked.
+                assert current is not None
+                result = current
+                generation = result.generation
+                for worker_node in active_workers:
+                    result.expect(worker_node.id)
+                    if worker_node.id not in result.acked_workers and worker_node.last_target:
+                        self._send_spawn_to_worker(worker_node.id, worker_node.last_target, generation)
+            else:
+                result = self._command_ledger.submit(
+                    INTENT_SPAWN, target, expected_workers={worker_node.id for worker_node in active_workers}
+                )
+                self.last_command_result = result
+                generation = result.generation
+                logger.info("Cluster spawn command submitted with generation %i", generation)
 
-        if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
-            self.stats.clear_all()
-            self.exceptions = {}
-            self.environment._filter_tasks_by_tags()
-            self.environment.events.test_start.fire(environment=self.environment)
-            if self.environment.shape_class:
-                self.environment.shape_class.reset_time()
+                # Lifecycle gating inside the serialized section: concurrent starts cannot
+                # both observe a non-running state, so test_start fires at most once per
+                # running generation.
+                if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
+                    self.stats.clear_all()
+                    self.exceptions = {}
+                    self.environment._filter_tasks_by_tags()
+                    self.environment.events.test_start.fire(environment=self.environment)
+                    if self.environment.shape_class:
+                        self.environment.shape_class.reset_time()
 
-        self.update_state(STATE_SPAWNING)
+                self.update_state(STATE_SPAWNING)
 
-        self._users_dispatcher.new_dispatch(
-            target_user_count=user_count, spawn_rate=spawn_rate, user_classes=user_classes
-        )
+                self._users_dispatcher.new_dispatch(
+                    target_user_count=user_count, spawn_rate=spawn_rate, user_classes=user_classes
+                )
 
+        if coalesced:
+            # A coalesced caller does not own the dispatch: wait bounded for convergence but
+            # never terminalize the shared result (the dispatch owner is timeout authority).
+            result.wait(self._wait_for_workers_report_after_ramp_up())
+            self.last_command_result = result
+            return result
+
+        dispatched_users: dict[str, dict[str, int]] = {}
         try:
             for dispatched_users in self._users_dispatcher:
+                # A newer intent may have superseded this generation while we were
+                # dispatching. Remaining batches would carry the old generation and
+                # workers would drop them as stale, so stop sending them. A plain
+                # convergence TIMEOUT must NOT stop the ramp: it only bounds how long
+                # start() blocks afterwards, and a late ack is still reconciled.
+                if self._command_ledger.current is not result:
+                    break
                 dispatch_greenlets = Group()
                 for worker_node_id, worker_user_classes_count in dispatched_users.items():
-                    data = {
-                        "timestamp": time.time(),
-                        "user_classes_count": worker_user_classes_count,
-                        "host": self.environment.host,
-                        "stop_timeout": self.environment.stop_timeout,
-                        "parsed_options": vars(self.environment.parsed_options)
-                        if self.environment.parsed_options
-                        else {},
-                    }
                     dispatch_greenlets.add(
                         gevent.spawn_later(
                             0,
-                            self.server.send_to_client,
-                            Message("spawn", data, worker_node_id),
+                            self._send_spawn_to_worker,
+                            worker_node_id,
+                            dict(worker_user_classes_count),
+                            generation,
                         )
                     )
                 dispatched_user_count = sum(map(sum, map(methodcaller("values"), dispatched_users.values())))
@@ -816,7 +1177,8 @@ class MasterRunner(DistributedRunner):
                     f"Currently spawned users: {_format_user_classes_count_for_log(self.reported_user_classes_count)}"
                 )
 
-            self.target_user_classes_count = _aggregate_dispatched_users(dispatched_users)
+            if self._command_ledger.current is result:
+                self.target_user_classes_count = _aggregate_dispatched_users(dispatched_users)
 
         except KeyboardInterrupt:
             # TODO: Find a cleaner way to handle that
@@ -824,19 +1186,31 @@ class MasterRunner(DistributedRunner):
             # a gevent.sleep inside the dispatch_users function, locust won't gracefully shutdown.
             self.quit()
 
-        # Wait a little for workers to report their users to the master
-        # so that we can give an accurate log message below and fire the `spawning_complete` event
-        # when the user count is really at the desired value.
+        # A superseded generation never owns cluster state: it must not fire
+        # spawning_complete (the superseding generation does); hand the result back.
+        if result.status == COMMAND_SUPERSEDED:
+            logger.info("Spawn generation %i was superseded by a newer intent", generation)
+            return result
+
+        # Bounded convergence wait: start() blocks until the generation is confirmed by
+        # the workers, superseded by a newer intent, or the report wait-time elapses.
+        # The reported user count below is only used for an accurate log message.
         timeout = gevent.Timeout(self._wait_for_workers_report_after_ramp_up())
         timeout.start()
         msg_prefix = "All users spawned"
         try:
-            while self.user_count != self.target_user_count:
-                gevent.sleep(0.01)
+            while not result.is_terminal:
+                result.wait(0.01)
+            if result.status == COMMAND_SUPERSEDED:
+                return result
+            if self.user_count != self.target_user_count:
+                gevent.sleep(0)  # let a final report land before logging
         except gevent.Timeout:
             msg_prefix = (
                 "Spawning is complete and report waittime is expired, but not all reports received from workers"
             )
+            if not result.is_terminal:
+                result.finish(COMMAND_TIMEOUT)
         finally:
             timeout.cancel()
 
@@ -847,6 +1221,17 @@ class MasterRunner(DistributedRunner):
         self.spawning_completed = True
 
         logger.info(f"{msg_prefix}: {_format_user_classes_count_for_log(self.reported_user_classes_count)}")
+        return result
+
+    def _await_command_result(self, result: ClusterCommandResult, timeout: float) -> None:
+        """Wait for a generation to reach a terminal state, timing it out if necessary."""
+        if result.is_terminal:
+            return
+        result.wait(timeout)
+        if not result.is_terminal:
+            # A topology change (worker dropped) may have confirmed it concurrently;
+            # only the waiter times the generation out.
+            result.finish(COMMAND_TIMEOUT)
 
     @functools.lru_cache
     def _wait_for_workers_report_after_ramp_up(self) -> float:
@@ -872,48 +1257,99 @@ class MasterRunner(DistributedRunner):
         else:
             return float(match.group("coeff")) * WORKER_REPORT_INTERVAL
 
-    def stop(self, send_stop_to_client: bool = True) -> None:
-        if self.state not in [STATE_INIT, STATE_STOPPED, STATE_STOPPING]:
-            logger.debug("Stopping...")
-            self.environment.events.test_stopping.fire(environment=self.environment)
-            self.final_user_classes_count = {**self.reported_user_classes_count}
-            self.update_state(STATE_STOPPING)
+    def stop(self, send_stop_to_client: bool = True, _allow_join: bool = True) -> ClusterCommandResult | None:
+        # Serialized section: the state check, lifecycle firing and command submission
+        # must be one atomic transition so concurrent/re-entrant stop() calls cannot
+        # duplicate commands or lifecycle events. The convergence wait is below, outside
+        # the lock, to leave start() able to supersede a stalled stop.
+        # ``_allow_join`` is False when quit() drives the teardown itself: in that case an
+        # in-flight stop owns the lifecycle and quit must neither join nor fire events.
+        join_result: ClusterCommandResult | None = None
+        result: ClusterCommandResult | None = None
+        fire_test_stop = False
+        with self._command_lock:
+            if self.state in [STATE_INIT, STATE_STOPPED]:
+                return None
+            if self.state == STATE_STOPPING:
+                # A stop is already in flight: join its result instead of sending a new
+                # stop generation or firing the lifecycle events a second time.
+                existing = self.last_command_result
+                if _allow_join and existing is not None and existing.intent == INTENT_STOP:
+                    join_result = existing
+                # Otherwise (e.g. called from quit() while another stop is converging)
+                # there is nothing to submit and no lifecycle event to fire.
+            else:
+                fire_test_stop = True
+                logger.debug("Stopping...")
+                self.environment.events.test_stopping.fire(environment=self.environment)
+                self.final_user_classes_count = {**self.reported_user_classes_count}
+                self.update_state(STATE_STOPPING)
 
-            if (
-                self.environment.shape_class is not None
-                and self.shape_greenlet is not None
-                and self.shape_greenlet is not greenlet.getcurrent()
-            ):
-                self.shape_greenlet.kill(block=True)
-                self.shape_greenlet = None
-                self.shape_last_tick = None
+                if (
+                    self.environment.shape_class is not None
+                    and self.shape_greenlet is not None
+                    and self.shape_greenlet is not greenlet.getcurrent()
+                ):
+                    self.shape_greenlet.kill(block=True)
+                    self.shape_greenlet = None
+                    self.shape_last_tick = None
 
-            self._users_dispatcher = None
+                self._users_dispatcher = None
 
-            if send_stop_to_client:
-                for client in self.clients.all:
-                    logger.debug(f"Sending stop message to worker {client.id}")
-                    self.server.send_to_client(Message("stop", None, client.id))
+                if send_stop_to_client:
+                    result = self._command_ledger.submit(
+                        INTENT_STOP, None, expected_workers={client.id for client in self.clients.all}
+                    )
+                    self.last_command_result = result
+                    stop_generation = result.generation
+                    logger.info("Cluster stop command submitted with generation %i", stop_generation)
+                    for client in self.clients.all:
+                        logger.debug(f"Sending stop message to worker {client.id}")
+                        self.server.send_to_client(Message("stop", {"generation": stop_generation}, client.id))
 
-                # Give an additional 60s for all workers to stop
-                timeout = gevent.Timeout(self.environment.stop_timeout + 60)
-                timeout.start()
-                try:
-                    while self.user_count != 0:
-                        gevent.sleep(1)
-                except gevent.Timeout:
-                    logger.error("Timeout waiting for all workers to stop")
-                finally:
-                    timeout.cancel()
+        if join_result is not None:
+            join_result.wait(self.environment.stop_timeout + 60)
+            return join_result
+
+        if result is not None:
+            # Wait for workers to acknowledge the generation, bounded by stop_timeout + 60s.
+            # A reported user count of zero is accepted as converging evidence as well
+            # (workers that vanished cannot acknowledge), matching the historical wait.
+            deadline = time.time() + self.environment.stop_timeout + 60
+            while not result.is_terminal:
+                if self.user_count == 0:
+                    result.finish(COMMAND_CONFIRMED)
+                    break
+                result.wait(min(1.0, max(deadline - time.time(), 0)))
+                if time.time() >= deadline:
+                    result.finish(COMMAND_TIMEOUT)
+                    break
+            if result.status == COMMAND_TIMEOUT:
+                logger.error("Timeout waiting for all workers to stop")
+
+        # test_stop fires exactly once: only the caller that performed the STOPPING
+        # transition above fires it (re-entrant callers return join_result).
+        if fire_test_stop:
             self.environment.events.test_stop.fire(environment=self.environment)
+        return result
 
     def quit(self) -> None:
-        self.stop(send_stop_to_client=False)
-        logger.debug("Quitting...")
-        for client in self.clients.all:
-            logger.debug(f"Sending quit message to worker {client.id} (index {self.get_worker_index(client.id)})")
-            self.server.send_to_client(Message("quit", None, client.id))
+        with self._command_lock:
+            self.stop(send_stop_to_client=False, _allow_join=False)
+            logger.debug("Quitting...")
+            result = self._command_ledger.submit(
+                INTENT_QUIT, None, expected_workers={client.id for client in self.clients.all}
+            )
+            self.last_command_result = result
+            quit_generation = result.generation
+            for client in self.clients.all:
+                logger.debug(f"Sending quit message to worker {client.id} (index {self.get_worker_index(client.id)})")
+                self.server.send_to_client(Message("quit", {"generation": quit_generation}, client.id))
         gevent.sleep(0.5)  # wait for final stats report from all workers
+        # Workers cannot acknowledge quit (they terminate immediately): delivery to the
+        # worker set that was connected at submit time is the terminal fact.
+        if not result.is_terminal:
+            result.finish(COMMAND_CONFIRMED)
         self.greenlet.kill(block=True)
 
     def check_stopped(self) -> None:
@@ -941,6 +1377,9 @@ class MasterRunner(DistributedRunner):
                     logger.info(f"Worker {str(client.id)} failed to send heartbeat, setting state to missing.")
                     client.state = STATE_MISSING
                     client.user_classes_count = {}
+                    # A missing worker cannot acknowledge the current generation; removing it
+                    # from the expected set lets the command result converge with the live set.
+                    self._command_ledger.drop_worker(client.id)
                     if self._users_dispatcher is not None:
                         self._users_dispatcher.remove_worker(client)
                         if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
@@ -956,6 +1395,7 @@ class MasterRunner(DistributedRunner):
             if len(missing_clients_to_be_removed) > 0:
                 for to_remove_client_id in missing_clients_to_be_removed:
                     if self.clients.get(to_remove_client_id) is not None:
+                        self._command_ledger.drop_worker(to_remove_client_id)
                         del self.clients[to_remove_client_id]
                 if self.state == STATE_RUNNING or self.state == STATE_SPAWNING:
                     # _users_dispatcher is set to none so that during redistribution the dead clients are not picked, alternative is to call self.stop() before start
@@ -1017,22 +1457,40 @@ class MasterRunner(DistributedRunner):
     def handle_message(self, client_id: str, msg: Message) -> None:
         match msg.type:
             case "client_ready":
-                if not msg.data:
-                    logger.error(f"An old (pre 2.0) worker tried to connect ({client_id}). That's not going to work.")
+                worker_version, worker_generation, worker_state = parse_client_ready_data(msg.data)
+                if worker_version is None:
+                    logger.error(
+                        f"An old worker (no cluster command generation support) tried to connect ({client_id}). That's not going to work."
+                    )
                     return
-                elif msg.data != __version__ and msg.data != -1:
-                    if msg.data[0:4] == __version__[0:4]:
+                elif worker_version != __version__ and worker_version != -1:
+                    if str(worker_version)[0:4] == __version__[0:4]:
                         logger.debug(
-                            f"A worker ({client_id}) running a different patch version ({repr(msg.data)}) connected, master version is {repr(__version__)}"
+                            f"A worker ({client_id}) running a different patch version ({repr(worker_version)}) connected, master version is {repr(__version__)}"
                         )
                     else:
                         logger.warning(
-                            f"A worker ({client_id}) running a different version ({msg.data}) connected, master version is {__version__}"
+                            f"A worker ({client_id}) running a different version ({worker_version}) connected, master version is {__version__}"
                         )
-                self.send_message("ack", client_id=client_id, data={"index": self.get_worker_index(client_id)})
+                self.send_message("ack", client_id=client_id, data=self._handshake_ack_data(client_id))
                 self.environment.events.worker_connect.fire(client_id=msg.node_id)
                 client_already_connected = client_id in self.clients
-                self.clients[client_id] = WorkerNode(client_id, heartbeat_liveness=HEARTBEAT_LIVENESS)
+                new_node = WorkerNode(client_id, heartbeat_liveness=HEARTBEAT_LIVENESS)
+                new_node.last_generation = worker_generation
+                if client_already_connected and worker_state is not None:
+                    # A reconnecting worker (duplicate client_ready): preserve what we know about
+                    # its running users, trust its reported state and recorded generation until the
+                    # next heartbeat reconciles it.
+                    existing = self.clients[client_id]
+                    new_node.state = worker_state
+                    new_node.user_classes_count = existing.user_classes_count
+                    new_node.last_target = existing.last_target
+                    if self._command_ledger.is_current(existing.last_generation):
+                        new_node.last_generation = max(worker_generation, existing.last_generation)
+                self.clients[client_id] = new_node
+                if not client_already_connected:
+                    # A freshly connected worker must acknowledge any in-flight generation
+                    self._command_ledger.expect_worker(client_id)
                 if self._users_dispatcher is not None:
                     self._users_dispatcher.add_worker(worker_node=self.clients[client_id])
                     if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
@@ -1048,6 +1506,9 @@ class MasterRunner(DistributedRunner):
                     )
                 if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
                     self.start(self.target_user_count, self.spawn_rate)
+                # Reconcile a reconnecting/new worker that reported an older watermark
+                # with the current generation (idempotent no-op when already aligned).
+                self._resync_worker(client_id)
                 # emit a warning if the worker's clock seem to be out of sync with our clock
                 # if abs(time() - msg.data["time"]) > 5.0:
                 #    warnings.warn("The worker node's clock seem to be out of sync. For the statistics to be correct the different locust servers need to have synchronized clocks.")
@@ -1099,7 +1560,10 @@ class MasterRunner(DistributedRunner):
                 if msg.node_id not in self.clients:
                     logger.warning(f"Received {msg.type} message from an unknown worker: {msg.node_id}.")
                     return
+                stopped_generation = msg.data.get("generation", -1) if isinstance(msg.data, dict) else -1
                 client = self.clients[msg.node_id]
+                client.last_generation = max(client.last_generation, stopped_generation)
+                self._command_ledger.observe_ack(msg.node_id, stopped_generation, msg.data)
                 del self.clients[msg.node_id]
                 if self._users_dispatcher is not None:
                     self._users_dispatcher.remove_worker(client)
@@ -1120,6 +1584,8 @@ class MasterRunner(DistributedRunner):
                                 # TODO: Test this situation
                                 self.start(self.target_user_count, self.spawn_rate)
                     c.state = client_state
+                    if "generation" in msg.data:
+                        c.last_generation = max(c.last_generation, int(msg.data["generation"]))
                     c.cpu_usage = msg.data["current_cpu_usage"]
                     if not c.cpu_warning_emitted and c.cpu_usage > 90:
                         self.worker_cpu_warning_emitted = True  # used to fail the test in the end
@@ -1140,11 +1606,17 @@ class MasterRunner(DistributedRunner):
                     self.clients[msg.node_id].state = STATE_SPAWNING
                 except KeyError:
                     logger.warning(f"Got spawning message from unknown worker {msg.node_id}. Asking worker to quit.")
-                    self.server.send_to_client(Message("quit", None, msg.node_id))
+                    self.server.send_to_client(
+                        Message("quit", {"generation": self._command_ledger.generation}, msg.node_id)
+                    )
             case "spawning_complete":
                 # a worker finished spawning (this happens multiple times during rampup)
-                self.clients[msg.node_id].state = STATE_RUNNING
-                self.clients[msg.node_id].user_classes_count = msg.data["user_classes_count"]
+                node = self.clients[msg.node_id]
+                node.state = STATE_RUNNING
+                node.user_classes_count = msg.data["user_classes_count"]
+                spawned_generation = msg.data.get("generation", -1)
+                node.last_generation = max(node.last_generation, spawned_generation)
+                self._command_ledger.observe_ack(msg.node_id, spawned_generation, msg.data)
             case "logs":
                 self.environment.update_worker_logs(msg.data)
             case "quit":
@@ -1164,6 +1636,34 @@ class MasterRunner(DistributedRunner):
                         self.stop()
                         if self.environment.parsed_options and self.environment.parsed_options.headless:
                             self.quit()
+            case "command_ack":
+                # Generation-correlated acknowledgement that a worker applied an intent
+                if msg.node_id not in self.clients:
+                    logger.debug("Got command_ack from unknown worker %s", msg.node_id)
+                    return
+                acked_generation = int(msg.data.get("generation", -1))
+                self.clients[msg.node_id].last_generation = max(
+                    self.clients[msg.node_id].last_generation, acked_generation
+                )
+                routed = self._command_ledger.observe_ack(msg.node_id, acked_generation, msg.data)
+                if routed is None and acked_generation < self._command_ledger.generation:
+                    # Worker answered for an old generation: drive it to the current intent
+                    self._resync_worker(msg.node_id)
+            case "command_stale":
+                # The worker discarded one of our commands because it already applied a
+                # newer generation. Record its watermark and re-drive it to current intent.
+                worker_generation = msg.data.get("generation", -1) if msg.data else -1
+                if msg.node_id in self.clients:
+                    self.clients[msg.node_id].last_generation = max(
+                        self.clients[msg.node_id].last_generation, worker_generation
+                    )
+                logger.info(
+                    "Worker %s discarded a stale command (its generation: %s, current: %i)",
+                    msg.node_id,
+                    worker_generation,
+                    self._command_ledger.generation,
+                )
+                self._resync_worker(msg.node_id)
             case "exception":
                 self.log_exception(msg.node_id, msg.data["msg"], msg.data["traceback"])
             case _ if lc := self.custom_messages.get(msg.type):
@@ -1239,6 +1739,14 @@ class WorkerRunner(DistributedRunner):
         self.last_heartbeat_timestamp: float | None = None
         self.connection_event = Event()
         self.worker_state = STATE_INIT
+        # Cluster command ordering: highest applied generation, its intent fingerprint
+        # ("spawn"/"stop"/"quit" + target) and the generation whose test_start has fired.
+        self._applied_generation: int = -1
+        self._applied_target: Any = None
+        self._running_generation: int | None = None
+        # Master's view reported in the latest ack (None before the first handshake)
+        self._master_intent: str | None = None
+        self._master_generation: int = -1
         self.client_id = socket.gethostname() + "_" + uuid4().hex
         self.master_host = master_host
         self.master_port = master_port
@@ -1274,12 +1782,16 @@ class WorkerRunner(DistributedRunner):
 
         self.environment.events.user_error.add_listener(on_user_error)
 
-    def spawning_complete(self, user_count):
+    def spawning_complete(self, user_count, generation: int | None = None):
         assert user_count == sum(self.user_classes_count.values())
         self.client.send(
             Message(
                 "spawning_complete",
-                {"user_classes_count": self.user_classes_count, "user_count": self.user_count},
+                {
+                    "user_classes_count": self.user_classes_count,
+                    "user_count": self.user_count,
+                    "generation": self._applied_generation if generation is None else generation,
+                },
                 self.client_id,
             )
         )
@@ -1290,11 +1802,12 @@ class WorkerRunner(DistributedRunner):
     ) -> None:
         raise NotImplementedError("use start_worker")
 
-    def start_worker(self, user_classes_count: dict[str, int], **kwargs) -> None:
+    def start_worker(self, user_classes_count: dict[str, int], *, generation: int) -> None:
         """
         Start running a load test as a worker
 
         :param user_classes_count: Users to run
+        :param generation: Cluster command generation this dispatch belongs to
         """
         self.target_user_classes_count = user_classes_count
         self.target_user_count = sum(user_classes_count.values())
@@ -1316,9 +1829,49 @@ class WorkerRunner(DistributedRunner):
         # can be blocking because of the stop_timeout
         self.spawn_users(user_classes_spawn_count)
         self.stop_users(user_classes_stop_count)
-        self.spawning_complete(sum(self.user_classes_count.values()))
+        self.spawning_complete(sum(self.user_classes_count.values()), generation)
+        # Explicit, generation-correlated acknowledgement of an applied cluster command
+        self._send_command_ack(generation, INTENT_SPAWN)
         self.update_state(STATE_RUNNING)
         self.worker_state = STATE_RUNNING
+
+    def _classify_command(self, generation: int, intent: str, fingerprint: Any) -> str:
+        """
+        Decide what to do with an incoming state command.
+
+        - ``stale``: generation older than the applied watermark, must be discarded
+        - ``noop``: same generation and same applied intent/target, acknowledge idempotently
+        - ``apply``: new generation, or same generation with a changed target (rebalance)
+        """
+        if generation < self._applied_generation:
+            return "stale"
+        if generation == self._applied_generation and self._applied_target == (intent, fingerprint):
+            return "noop"
+        return "apply"
+
+    def _send_command_stale(self) -> None:
+        self.client.send(
+            Message(
+                "command_stale",
+                {"generation": self._applied_generation, "state": self.worker_state},
+                self.client_id,
+            )
+        )
+
+    def _send_command_ack(self, generation: int, intent: str) -> None:
+        self.client.send(
+            Message(
+                "command_ack",
+                {
+                    "generation": generation,
+                    "intent": intent,
+                    "state": self.worker_state,
+                    "user_classes_count": self.user_classes_count,
+                    "user_count": self.user_count,
+                },
+                self.client_id,
+            )
+        )
 
     def heartbeat(self) -> NoReturn:
         while True:
@@ -1330,6 +1883,7 @@ class WorkerRunner(DistributedRunner):
                             "state": self.worker_state,
                             "current_cpu_usage": self.current_cpu_usage,
                             "current_memory_usage": self.current_memory_usage,
+                            "generation": self._applied_generation,
                         },
                         self.client_id,
                     )
@@ -1355,7 +1909,6 @@ class WorkerRunner(DistributedRunner):
             logger.error(f"Temporary failure when resetting connection: {e}, will retry later.")
 
     def worker(self) -> NoReturn:
-        self.last_received_spawn_timestamp = 0
         while True:
             try:
                 msg = self.client.recv()
@@ -1370,15 +1923,44 @@ class WorkerRunner(DistributedRunner):
                 # backward-compatible support of masters that do not send a worker index
                 if msg.data is not None and "index" in msg.data:
                     self.worker_index = msg.data["index"]
+                if isinstance(msg.data, dict) and "generation" in msg.data:
+                    master_generation = int(msg.data["generation"])
+                    self._master_generation = master_generation
+                    self._master_intent = msg.data.get("intent")
+                    if master_generation < self._applied_generation:
+                        # A restarted/reset master speaks for a lower generation; adopt
+                        # its authority and let post-handshake reconciliation converge
+                        # us to its current intent instead of discarding it as stale.
+                        logger.info(
+                            "Master generation %i is older than applied generation %i, adopting master authority after reconnect",
+                            master_generation,
+                            self._applied_generation,
+                        )
+                        self._applied_generation = master_generation
+                        self._applied_target = None
+                        self._running_generation = None
                 self.connection_event.set()
             case "spawn":
-                self.client.send(Message("spawning", None, self.client_id))
                 job = msg.data
-                if job["timestamp"] <= self.last_received_spawn_timestamp:
+                generation = int(job.get("generation", -1))
+                fingerprint = tuple(sorted(job["user_classes_count"].items()))
+                decision = self._classify_command(generation, INTENT_SPAWN, fingerprint)
+                if decision == "stale":
                     logger.info(
-                        "Discard spawn message with older or equal timestamp than timestamp of previous spawn message"
+                        "Discarding stale spawn (generation %i), already applied generation %i",
+                        generation,
+                        self._applied_generation,
                     )
+                    self._send_command_stale()
                     return
+                if decision == "noop":
+                    logger.debug(
+                        "Duplicate spawn for generation %i with the same target, re-acknowledging", generation
+                    )
+                    self._send_command_ack(generation, INTENT_SPAWN)
+                    return
+
+                self.client.send(Message("spawning", {"generation": generation}, self.client_id))
                 self.environment.host = job["host"]
                 self.environment.stop_timeout = job["stop_timeout"] or 0.0
 
@@ -1396,34 +1978,87 @@ class WorkerRunner(DistributedRunner):
                 }
                 vars(self.environment.parsed_options).update(custom_args_from_master)
 
-                if self.worker_state != STATE_RUNNING and self.worker_state != STATE_SPAWNING:
+                # Lifecycle fires at most once per running generation, including across
+                # same-generation rebalances (changed target) and reconnect re-dispatches.
+                if self._running_generation != generation:
                     self.stats.clear_all()
                     self.exceptions = {}
                     self.cpu_warning_emitted = False
                     self.worker_cpu_warning_emitted = False
                     self.environment._filter_tasks_by_tags()
                     self.environment.events.test_start.fire(environment=self.environment)
+                    self._running_generation = generation
 
                 self.worker_state = STATE_SPAWNING
 
                 if self.spawning_greenlet:
                     # kill existing spawning greenlet before we launch new one
                     self.spawning_greenlet.kill(block=True)
-                self.spawning_greenlet = self.greenlet.spawn(lambda: self.start_worker(job["user_classes_count"]))
+                self.spawning_greenlet = self.greenlet.spawn(
+                    lambda: self.start_worker(job["user_classes_count"], generation=generation)
+                )
                 self.spawning_greenlet.link_exception(locust_exception_handler(self.environment))
-                self.last_received_spawn_timestamp = job["timestamp"]
+                self._applied_generation = generation
+                self._applied_target = (INTENT_SPAWN, fingerprint)
             case "stop":
-                self.stop()
-                self.client.send(Message("client_stopped", None, self.client_id))
+                if isinstance(msg.data, dict) and "generation" in msg.data:
+                    stop_generation = int(msg.data["generation"])
+                    decision = self._classify_command(stop_generation, INTENT_STOP, None)
+                else:
+                    # Legacy payloads without a generation are treated as newer-than-watermark
+                    stop_generation = max(self._applied_generation + 1, 0)
+                    decision = "apply"
+                if decision == "stale":
+                    logger.info(
+                        "Discarding stale stop (generation %i), already applied generation %i",
+                        stop_generation,
+                        self._applied_generation,
+                    )
+                    self._send_command_stale()
+                    return
+                if decision == "noop":
+                    logger.debug("Duplicate stop for generation %i, re-acknowledging", stop_generation)
+                    self._send_command_ack(stop_generation, INTENT_STOP)
+                    return
+
+                self._applied_generation = stop_generation
+                self._applied_target = (INTENT_STOP, None)
+                if self._running_generation is not None:
+                    self.stop()
+                    self._running_generation = None
+                self._send_command_ack(stop_generation, INTENT_STOP)
+                self.client.send(Message("client_stopped", {"generation": stop_generation}, self.client_id))
                 # +additional_wait is just a small buffer to account for the random network latencies and/or other
                 # random delays inherent to distributed systems.
                 additional_wait = int(os.getenv("LOCUST_WORKER_ADDITIONAL_WAIT_BEFORE_READY_AFTER_STOP", 0))
                 gevent.sleep(self.environment.stop_timeout + additional_wait)
-                self.client.send(Message("client_ready", __version__, self.client_id))
                 self.worker_state = STATE_INIT
+                self.client.send(
+                    Message(
+                        "client_ready",
+                        make_client_ready_data(__version__, self._applied_generation, self.worker_state),
+                        self.client_id,
+                    )
+                )
             case "quit":
+                quit_generation = (
+                    int(msg.data["generation"]) if isinstance(msg.data, dict) and "generation" in msg.data else None
+                )
+                if quit_generation is not None and quit_generation < self._applied_generation:
+                    logger.info(
+                        "Discarding stale quit (generation %i), already applied generation %i",
+                        quit_generation,
+                        self._applied_generation,
+                    )
+                    self._send_command_stale()
+                    return
+                if quit_generation is not None:
+                    self._applied_generation = quit_generation
+                    self._applied_target = (INTENT_QUIT, None)
                 logger.info("Got quit message from master, shutting down...")
-                self.stop()
+                if self._running_generation is not None:
+                    self.stop()
+                    self._running_generation = None
                 self._send_stats()  # send a final report, in case there were any samples not yet reported
                 self.greenlet.kill(block=True)
             case "reconnect":
@@ -1497,7 +2132,13 @@ class WorkerRunner(DistributedRunner):
 
     def connect_to_master(self):
         self.retry += 1
-        self.client.send(Message("client_ready", __version__, self.client_id))
+        self.client.send(
+            Message(
+                "client_ready",
+                make_client_ready_data(__version__, self._applied_generation, self.worker_state),
+                self.client_id,
+            )
+        )
         try:
             success = self.connection_event.wait(timeout=CONNECT_TIMEOUT)
         except KeyboardInterrupt:

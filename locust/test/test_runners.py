@@ -989,6 +989,218 @@ class TestMasterWorkerRunners(LocustTestCase):
             "For some reason the master node's stats has not come in",
         )
 
+    def test_distributed_rapid_successive_starts_converge_to_latest_generation(self):
+        """
+        TR-4.1: with start(10)->start(25)->start(7) issued in quick succession while the
+        first generation is unconfirmed, only the latest generation confirms cluster-wide;
+        the superseded generation is recorded and all workers end at the latest target.
+        """
+
+        class TestUser(User):
+            wait_time = constant(1000)
+
+            @task
+            def incr_stats(self):
+                pass
+
+        with (
+            mock.patch("locust.runners.WORKER_REPORT_INTERVAL", new=0.3),
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "5"),
+        ):
+            master_env = Environment(user_classes=[TestUser])
+            master = master_env.create_master_runner("*", 0)
+            sleep(0)
+            workers = []
+            for i in range(3):
+                worker_env = Environment(user_classes=[TestUser])
+                workers.append(worker_env.create_worker_runner("127.0.0.1", master.server.port))
+            sleep(0.2)
+
+            terminal_results = []
+            original_callback = master._on_command_result_terminal
+
+            def collect_terminal(result):
+                terminal_results.append((result.generation, result.intent, result.status))
+                original_callback(result)
+
+            master._command_ledger._on_terminal = collect_terminal
+
+            # Hold generation 1 unconfirmed so the second start supersedes it
+            original_observe = master._command_ledger.observe_ack
+
+            def observe_without_generation_one(worker_id, generation, payload=None):
+                if generation == 1:
+                    return None
+                return original_observe(worker_id, generation, payload)
+
+            master._command_ledger.observe_ack = observe_without_generation_one
+
+            g1 = gevent.spawn(master.start, 6, spawn_rate=1000)
+            sleep(0.4)
+            self.assertFalse(g1.ready())
+            g2 = gevent.spawn(master.start, 15, spawn_rate=1000)
+            sleep(0.4)
+            g3 = gevent.spawn(master.start, 9, spawn_rate=1000)
+            gevent.joinall([g1, g2, g3], timeout=10)
+            self.assertTrue(g1.ready() and g2.ready() and g3.ready(), "all start() calls returned")
+
+            self.assertIn((1, "spawn", "superseded"), terminal_results)
+            final_result = master.last_command_result
+            self.assertIsNotNone(final_result)
+            assert final_result is not None
+            self.assertEqual(3, final_result.generation)
+            self.assertTrue(final_result.confirmed)
+            self.assertEqual(9, final_result.target[0])
+
+            sleep(0.2)
+            self.assertEqual(9, master.target_user_count)
+            self.assertEqual(9, sum(worker.user_count for worker in workers))
+            for worker in workers:
+                self.assertEqual(3, worker.user_count)
+
+            master.quit()
+            sleep(0)
+            for worker in workers:
+                self.assertEqual(0, worker.user_count)
+
+    def test_concurrent_starts_coalesce_same_target_and_order_new_targets(self):
+        """
+        TR-5.1: concurrent start() calls with the same target coalesce onto one
+        generation/dispatch; concurrent different targets produce strictly ordered
+        generations, test_start fires once per running generation, and the cluster
+        converges to the last target.
+        """
+
+        class TestUser(User):
+            wait_time = constant(1000)
+
+            @task
+            def incr_stats(self):
+                pass
+
+        with (
+            mock.patch("locust.runners.WORKER_REPORT_INTERVAL", new=0.3),
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "5"),
+        ):
+            master_env = Environment(user_classes=[TestUser])
+            master = master_env.create_master_runner("*", 0)
+            sleep(0)
+            workers = []
+            for i in range(3):
+                worker_env = Environment(user_classes=[TestUser])
+                workers.append(worker_env.create_worker_runner("127.0.0.1", master.server.port))
+            sleep(0.2)
+
+            test_start_count = [0]
+
+            @master_env.events.test_start.add_listener
+            def on_master_test_start(*_, **__):
+                test_start_count[0] += 1
+
+            # Same target, three concurrent callers: exactly one generation/dispatch
+            same_greenlets = [gevent.spawn(master.start, 6, spawn_rate=1000) for _ in range(3)]
+            gevent.joinall(same_greenlets, timeout=10)
+            self.assertTrue(all(g.ready() and g.value is not None for g in same_greenlets))
+            same_results = [g.value for g in same_greenlets]
+            self.assertIs(same_results[0], same_results[1])
+            self.assertIs(same_results[1], same_results[2])
+            same_generation = same_results[0].generation
+            sleep(0.2)
+            self.assertEqual(6, sum(worker.user_count for worker in workers))
+            self.assertEqual(1, test_start_count[0])
+
+            # Different targets dispatched concurrently: ordered generations, last wins
+            diff_greenlets = [
+                gevent.spawn(master.start, target, spawn_rate=1000) for target in (3, 9, 12)
+            ]
+            gevent.joinall(diff_greenlets, timeout=15)
+            self.assertTrue(all(g.ready() and g.value is not None for g in diff_greenlets))
+            generations = [g.value.generation for g in diff_greenlets]
+            self.assertEqual(generations, sorted(generations))
+            self.assertGreater(generations[-1], same_generation)
+            final_result = master.last_command_result
+            self.assertIsNotNone(final_result)
+            assert final_result is not None
+            self.assertTrue(final_result.confirmed)
+            self.assertEqual(12, final_result.target[0])
+
+            sleep(0.2)
+            self.assertEqual(12, master.target_user_count)
+            self.assertEqual(12, sum(worker.user_count for worker in workers))
+            # No stop happened in between: one running generation, one test_start
+            self.assertEqual(1, test_start_count[0])
+
+            master.quit()
+
+    def test_rapid_start_stop_start_lifecycle_fires_once_per_generation(self):
+        """
+        TR-5.2: start -> stop -> start fires test_start / test_stopping / test_stop
+        exactly twice on master and on every worker - never duplicated, never missing.
+        """
+
+        class TestUser(User):
+            wait_time = constant(1000)
+
+            @task
+            def incr_stats(self):
+                pass
+
+        with patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "5"):
+            master_env = Environment(user_classes=[TestUser])
+            master = master_env.create_master_runner("*", 0)
+            sleep(0)
+
+            master_counts = {"test_start": 0, "test_stopping": 0, "test_stop": 0}
+            master_env.events.test_start.add_listener(lambda **_: master_counts.__setitem__("test_start", master_counts["test_start"] + 1))
+            master_env.events.test_stopping.add_listener(
+                lambda **_: master_counts.__setitem__("test_stopping", master_counts["test_stopping"] + 1)
+            )
+            master_env.events.test_stop.add_listener(lambda **_: master_counts.__setitem__("test_stop", master_counts["test_stop"] + 1))
+
+            worker_envs = []
+            for i in range(3):
+                worker_env = Environment(user_classes=[TestUser])
+                worker_envs.append(worker_env)
+                worker_env.create_worker_runner("127.0.0.1", master.server.port)
+            sleep(0.2)
+
+            worker_counts = [{"test_start": 0, "test_stopping": 0, "test_stop": 0} for _ in worker_envs]
+            for env, counts in zip(worker_envs, worker_counts, strict=True):
+                env.events.test_start.add_listener(
+                    lambda *_, c=counts, **__: c.__setitem__("test_start", c["test_start"] + 1)
+                )
+                env.events.test_stopping.add_listener(
+                    lambda *_, c=counts, **__: c.__setitem__("test_stopping", c["test_stopping"] + 1)
+                )
+                env.events.test_stop.add_listener(
+                    lambda *_, c=counts, **__: c.__setitem__("test_stop", c["test_stop"] + 1)
+                )
+
+            first_start = master.start(6, spawn_rate=1000)
+            self.assertIsNotNone(first_start)
+            assert first_start is not None
+            self.assertTrue(first_start.confirmed)
+            first_stop = master.stop()
+            self.assertIsNotNone(first_stop)
+            assert first_stop is not None
+            self.assertTrue(first_stop.is_terminal)
+            # worker stop handling is asynchronous
+            sleep(0.5)
+            second_start = master.start(6, spawn_rate=1000)
+            self.assertIsNotNone(second_start)
+            assert second_start is not None
+            self.assertTrue(second_start.confirmed)
+            sleep(0.2)
+            second_stop = master.stop()
+            self.assertIsNotNone(second_stop)
+            sleep(0.5)
+
+            self.assertEqual({"test_start": 2, "test_stopping": 2, "test_stop": 2}, master_counts)
+            for counts in worker_counts:
+                self.assertEqual({"test_start": 2, "test_stopping": 2, "test_stop": 2}, counts)
+
+            master.quit()
+
     def test_distributed_rebalanced_integration_run(self):
         """
         Full integration test that starts both a MasterRunner and three WorkerRunner instances
@@ -2288,14 +2500,14 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_worker_connect(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
             )
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client2"))
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client3"))
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client4"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client2"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client3"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client4"))
             self.assertEqual(4, len(master.clients))
 
             server.mocked_send(Message("quit", None, "zeh_fake_client3"))
@@ -2304,25 +2516,104 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_worker_connect_with_special_versions(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
+            # legacy handshake payloads (no generation support) are rejected
             server.mocked_send(Message("client_ready", None, "1.x_style_client_should_not_be_allowed"))
             self.assertEqual(1, len(self.mocked_log.error))
             self.assertEqual(0, len(master.clients))
-            server.mocked_send(Message("client_ready", "abcd", "other_version_mismatch_should_just_give_a_warning"))
-            self.assertEqual(1, len(self.mocked_log.warning))
-            self.assertEqual(1, len(master.clients))
-            server.mocked_send(Message("client_ready", -1, "version_check_bypass_should_not_warn"))
-            self.assertEqual(1, len(self.mocked_log.warning))
-            self.assertEqual(2, len(master.clients))
+            server.mocked_send(Message("client_ready", "abcd", "legacy_string_payload_should_not_be_allowed"))
+            self.assertEqual(2, len(self.mocked_log.error))
+            self.assertEqual(0, len(master.clients))
+            server.mocked_send(Message("client_ready", -1, "legacy_int_payload_should_not_be_allowed"))
+            self.assertEqual(3, len(self.mocked_log.error))
+            self.assertEqual(0, len(master.clients))
+            # the -1 version check bypass still works with the new dict payload
             server.mocked_send(
-                Message("client_ready", __version__ + "1", "difference_in_patch_version_should_not_warn")
+                Message(
+                    "client_ready",
+                    {"version": -1, "generation": -1, "state": STATE_INIT},
+                    "version_check_bypass_should_not_warn",
+                )
             )
-            self.assertEqual(3, len(master.clients))
-            self.assertEqual(1, len(self.mocked_log.warning))
+            self.assertEqual(1, len(master.clients))
+            self.assertEqual(0, len(self.mocked_log.warning))
+            # a different patch version only produces a debug/warning log
+            server.mocked_send(
+                Message(
+                    "client_ready",
+                    {"version": __version__ + "1", "generation": -1, "state": STATE_INIT},
+                    "difference_in_patch_version_should_not_warn",
+                )
+            )
+            self.assertEqual(2, len(master.clients))
+            self.assertEqual(0, len(self.mocked_log.warning))
+
+    def test_worker_handshake_carries_generation_and_ack_reports_master_generation(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            master._command_ledger.generation = 5
+            master._command_ledger.intent = runners.INTENT_SPAWN
+            master._command_ledger.target = (10, 5.0, ())
+            server.mocked_send(
+                Message(
+                    "client_ready",
+                    {"version": __version__, "generation": 2, "state": STATE_RUNNING},
+                    "reconnecting_worker",
+                )
+            )
+            node = master.clients["reconnecting_worker"]
+            self.assertEqual(2, node.last_generation)
+            ack_messages = server.get_messages("ack")
+            self.assertEqual(1, len(ack_messages))
+            self.assertEqual(5, ack_messages[0].data["generation"])
+            self.assertEqual(runners.INTENT_SPAWN, ack_messages[0].data["intent"])
+            self.assertEqual((10, 5.0, ()), tuple(ack_messages[0].data["target"]))
+
+    def test_duplicate_client_ready_preserves_running_worker_information(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(
+                Message(
+                    "client_ready",
+                    {"version": __version__, "generation": 4, "state": STATE_RUNNING},
+                    "worker1",
+                )
+            )
+            node = master.clients["worker1"]
+            node.user_classes_count = {"TestUser": 7}
+            node.last_target = {"TestUser": 7}
+            # worker resets its RPC connection and re-registers with the same id
+            server.mocked_send(
+                Message(
+                    "client_ready",
+                    {"version": __version__, "generation": 4, "state": STATE_RUNNING},
+                    "worker1",
+                )
+            )
+            node = master.clients["worker1"]
+            self.assertEqual(STATE_RUNNING, node.state)
+            self.assertEqual({"TestUser": 7}, node.user_classes_count)
+            self.assertEqual({"TestUser": 7}, node.last_target)
+            self.assertEqual(4, node.last_generation)
+
+    def test_command_stale_from_worker_is_logged(self):
+        with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
+            master = self.get_runner()
+            server.mocked_send(
+                Message(
+                    "client_ready",
+                    {"version": __version__, "generation": -1, "state": STATE_INIT},
+                    "worker1",
+                )
+            )
+            master._command_ledger.submit(runners.INTENT_SPAWN, target=(3, 1.0, ()), expected_workers=["worker1"])
+            server.mocked_send(Message("command_stale", {"generation": 3, "state": STATE_RUNNING}, "worker1"))
+            self.assertEqual(3, master.clients["worker1"].last_generation)
+            self.assertTrue(any("stale command" in m for m in self.mocked_log.info))
 
     def test_worker_stats_report_median(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
 
             master.stats.get("/", "GET").log(100, 23455)
             master.stats.get("/", "GET").log(800, 23455)
@@ -2339,7 +2630,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_worker_stats_report_with_none_response_times(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
 
             master.stats.get("/mixed", "GET").log(0, 23455)
             master.stats.get("/mixed", "GET").log(800, 23455)
@@ -2365,7 +2656,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_master_marks_downed_workers_as_missing(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
             sleep(6)
             # print(master.clients['fake_client'].__dict__)
             assert master.clients["fake_client"].state == STATE_MISSING
@@ -2381,8 +2672,8 @@ class TestMasterRunner(LocustRunnerTestCase):
             patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0.1"),
         ):
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client2"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client2"))
 
             master.start(1, 2)
             server.mocked_send(Message("spawning", None, "fake_client1"))
@@ -2438,9 +2729,9 @@ class TestMasterRunner(LocustRunnerTestCase):
             patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0.1"),
         ):
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client2"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client3"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client2"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client3"))
 
             master.start(3, 3)
             server.mocked_send(Message("spawning", None, "fake_client1"))
@@ -2510,9 +2801,9 @@ class TestMasterRunner(LocustRunnerTestCase):
             patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0.1"),
         ):
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client2"))
-            server.mocked_send(Message("client_ready", __version__, "fake_client3"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client2"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client3"))
 
             master.start(3, 3)
             server.mocked_send(Message("spawning", None, "fake_client1"))
@@ -2591,7 +2882,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_master_total_stats(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
             stats = RequestStats()
             stats.log_request("GET", "/1", 100, 3546)
             stats.log_request("GET", "/1", 800, 56743)
@@ -2626,7 +2917,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_master_total_stats_with_none_response_times(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
             stats = RequestStats()
             stats.log_request("GET", "/1", 100, 3546)
             stats.log_request("GET", "/1", 800, 56743)
@@ -2682,7 +2973,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 master = self.get_runner()
                 self.environment.stats.reset_all()
                 mocked_time.return_value += 1.0234
-                server.mocked_send(Message("client_ready", __version__, "fake_client"))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
                 stats = RequestStats()
                 stats.log_request("GET", "/1", 100, 3546)
                 stats.log_request("GET", "/1", 800, 56743)
@@ -2747,7 +3038,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
@@ -2764,7 +3055,7 @@ class TestMasterRunner(LocustRunnerTestCase):
             master.clients["zeh_fake_client1"].user_classes_count = {"TestUser": 100}
 
             # let another worker connect
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client2"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client2"))
             self.assertEqual(2, len(master.clients))
             sleep(0.1)  # give time for messages to be sent to clients
             spawn_messages = server.get_messages("spawn")
@@ -2802,8 +3093,8 @@ class TestMasterRunner(LocustRunnerTestCase):
             patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0"),
         ):
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "missing"))
-            server.mocked_send(Message("client_ready", __version__, "healthy"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "missing"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "healthy"))
 
             master.start(2, 100)
             master.clients["missing"].state = STATE_MISSING
@@ -2839,7 +3130,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 run_count[0] += 1
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             master.start(7, 7)
             self.assertEqual(15, len(server.get_messages()))
@@ -2878,7 +3169,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 self.runner_stopped = True
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             master.start(7, 7)
             self.assertEqual(15, len(server.get_messages()))
@@ -2888,7 +3179,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
             self.reset_state()
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
             master.start(7, 7)
             master.stop()
             master.quit()
@@ -2917,7 +3208,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 self.runner_stopped = True
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             master.start(7, 7)
             self.assertEqual(15, len(server.get_messages()))
@@ -2964,7 +3255,7 @@ class TestMasterRunner(LocustRunnerTestCase):
             master = self.get_runner(user_classes=[TestUser])
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             master.start(7, 7)
             self.assertEqual(15, len(server.outbox))
@@ -2982,7 +3273,7 @@ class TestMasterRunner(LocustRunnerTestCase):
             master = self.get_runner(user_classes=[TestUser])
 
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             master.start(2, 2)
             self.assertEqual(15, len(server.outbox))
@@ -3007,7 +3298,7 @@ class TestMasterRunner(LocustRunnerTestCase):
             USERS_COUNT = 5
 
             for i in range(USERS_COUNT):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             master.start(USERS_COUNT, USERS_COUNT)
             self.assertEqual(USERS_COUNT * 3, len(server.outbox))
@@ -3043,7 +3334,7 @@ class TestMasterRunner(LocustRunnerTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[MyUser])
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             # Start the shape_worker
             self.environment.shape_class.reset_time()
@@ -3095,7 +3386,7 @@ class TestMasterRunner(LocustRunnerTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[MyUser])
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             # Start the shape_worker
             self.environment.shape_class.reset_time()
@@ -3140,7 +3431,7 @@ class TestMasterRunner(LocustRunnerTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[MyUser])
             for i in range(5):
-                server.mocked_send(Message("client_ready", __version__, "fake_client%i" % i))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client%i" % i))
 
             # Start the shape_worker
             self.environment.shape_class.reset_time()
@@ -3235,7 +3526,7 @@ class TestMasterRunner(LocustRunnerTestCase):
                 self.assertEqual(0, len(master.clients))
                 server.mocked_send(Message("client_ready", NETWORK_BROKEN, "fake_client"))
                 self.assertTrue(master.connection_broken)
-                server.mocked_send(Message("client_ready", __version__, "fake_client"))
+                server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
                 sleep(1)
                 self.assertFalse(master.connection_broken)
                 self.assertEqual(1, len(master.clients))
@@ -3244,7 +3535,7 @@ class TestMasterRunner(LocustRunnerTestCase):
     def test_reset_connection_after_RPCError(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc(raise_on_close=False)) as server:
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "fake_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client"))
             sleep(0.2)
             self.assertFalse(master.connection_broken)
             self.assertEqual(1, len(master.clients))
@@ -3270,7 +3561,7 @@ class TestMasterRunner(LocustRunnerTestCase):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[MyUser1, MyUser2])
 
-            server.mocked_send(Message("client_ready", __version__, "fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "fake_client1"))
 
             master.start(7, 7)
             self.assertEqual({"MyUser1": 4, "MyUser2": 3}, master.target_user_classes_count)
@@ -3385,11 +3676,11 @@ class TestMasterRunner(LocustRunnerTestCase):
 
     def test_master_discard_first_client_ready(self):
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
-            server.mocked_send(Message("client_ready", __version__, "dummy_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "dummy_client"))
             # discard first client_ready msg
             server.queue.get()
             master = self.get_runner()
-            server.mocked_send(Message("client_ready", __version__, "dummy_client"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "dummy_client"))
 
             messages = server.get_messages()
 
@@ -3410,7 +3701,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
@@ -3443,7 +3734,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
@@ -3466,7 +3757,7 @@ class TestMasterRunner(LocustRunnerTestCase):
 
         with mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server:
             master = self.get_runner(user_classes=[TestUser])
-            server.mocked_send(Message("client_ready", __version__, "zeh_fake_client1"))
+            server.mocked_send(Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "zeh_fake_client1"))
             self.assertEqual(1, len(master.clients))
             self.assertTrue(
                 "zeh_fake_client1" in master.clients, "Could not find fake client in master instance's clients dict"
@@ -3476,6 +3767,293 @@ class TestMasterRunner(LocustRunnerTestCase):
             sleep(0.1)
             server.mocked_send(Message("stats", UNRECOGNIZED_HOST_MESSAGE, "unknown_host"))
             self.assertEqual(3, len(server.get_messages()))
+
+    def _master_with_fake_workers(self, server, user_class, count):
+        master = self.get_runner(user_classes=[user_class])
+        for i in range(count):
+            server.mocked_send(
+                Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, f"w{i}")
+            )
+        return master
+
+    def test_command_result_times_out_with_missing_list_then_confirms_on_drop(self):
+        """TR-4.2: a missing ack times out with an accurate missing list; dropping the
+        missing worker while still pending lets the result converge to confirmed."""
+
+        class TestUser(User):
+            @task
+            def my_task(self):
+                pass
+
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "2"),
+        ):
+            master = self._master_with_fake_workers(server, TestUser, 2)
+
+            def slow_start():
+                return master.start(2, 2)
+
+            start_greenlet = gevent.spawn(slow_start)
+            sleep(0.2)
+            result = master.last_command_result
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual({"w0", "w1"}, result.expected_workers)
+
+            # only w0 acknowledges the generation
+            server.mocked_send(
+                Message(
+                    "spawning_complete",
+                    {"user_classes_count": {"TestUser": 1}, "user_count": 1, "generation": result.generation},
+                    "w0",
+                )
+            )
+            sleep(0.05)
+            self.assertEqual({"w1"}, result.missing_workers)
+            self.assertFalse(result.is_terminal)
+
+            # w1 is declared dead (heartbeat removal): the in-flight result can now confirm
+            master._command_ledger.drop_worker("w1")
+            start_greenlet.join(timeout=1)
+            self.assertTrue(result.confirmed)
+            self.assertEqual({"w0"}, result.acked_workers)
+
+            # stop(): fake workers never ack, but a reported user count of zero converges
+            # the stop generation immediately (matching the historical behaviour)
+            stop_result = master.stop()
+            self.assertIsNotNone(stop_result)
+            assert stop_result is not None
+            self.assertTrue(stop_result.is_terminal)
+            self.assertEqual("stop", stop_result.intent)
+
+    def test_command_stale_triggers_resend_of_current_generation(self):
+        """TR-4.3: command_stale from a worker makes the master re-dispatch the current
+        intent to exactly that worker, and its later ack converges the result."""
+
+        class TestUser(User):
+            @task
+            def my_task(self):
+                pass
+
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "5"),
+        ):
+            master = self._master_with_fake_workers(server, TestUser, 1)
+
+            start_greenlet = gevent.spawn(master.start, 1, 1)
+            sleep(0.2)
+            result = master.last_command_result
+            assert result is not None
+            generation = result.generation
+
+            spawn_messages = [m for m in server.get_messages("spawn") if m.node_id == "w0"]
+            self.assertEqual(1, len(spawn_messages))
+            self.assertEqual(generation, spawn_messages[0].data["generation"])
+            self.assertEqual({"TestUser": 1}, master.clients["w0"].last_target)
+
+            # worker reports it discarded the command (its watermark is older)
+            server.outbox.clear()
+            server.mocked_send(Message("command_stale", {"generation": generation - 1, "state": "running"}, "w0"))
+            sleep(0.05)
+            resent = server.get_messages("spawn")
+            self.assertEqual(1, len(resent))
+            self.assertEqual(generation, resent[0].data["generation"])
+            self.assertEqual("w0", resent[0].node_id)
+
+            # the worker now accepts and acknowledges the generation
+            server.mocked_send(
+                Message(
+                    "command_ack",
+                    {
+                        "generation": generation,
+                        "intent": "spawn",
+                        "state": "running",
+                        "user_classes_count": {"TestUser": 1},
+                        "user_count": 1,
+                    },
+                    "w0",
+                )
+            )
+            start_greenlet.join(timeout=1)
+            self.assertTrue(result.confirmed)
+
+    def test_dispatched_commands_carry_generations_and_same_intent_reuses_it(self):
+        """TR-4.4: every spawn/stop/quit carries an integer generation; re-dispatching the
+        same (already terminal) intent reuses the generation number instead of bumping."""
+
+        class TestUser(User):
+            @task
+            def my_task(self):
+                pass
+
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "0.05"),
+        ):
+            master = self._master_with_fake_workers(server, TestUser, 2)
+
+            result1 = master.start(4, 4)
+            self.assertIsNotNone(result1)
+            assert result1 is not None
+            g1 = result1.generation
+            self.assertIsInstance(g1, int)
+            spawns_g1 = server.get_messages("spawn")
+            self.assertTrue(spawns_g1)
+            for message in spawns_g1:
+                self.assertEqual(g1, message.data["generation"])
+                self.assertIsInstance(message.data["generation"], int)
+
+            # re-dispatch the exact same target after terminal: same generation number
+            result2 = master.start(4, 4)
+            self.assertIsNotNone(result2)
+            assert result2 is not None
+            self.assertEqual(g1, result2.generation)
+            self.assertIsNot(result1, result2)
+            for message in server.get_messages("spawn"):
+                self.assertEqual(g1, message.data["generation"])
+
+            # a changed target allocates a new generation
+            result3 = master.start(6, 6)
+            assert result3 is not None
+            self.assertEqual(g1 + 1, result3.generation)
+
+            stop_result = master.stop()
+            assert stop_result is not None
+            self.assertEqual(g1 + 2, stop_result.generation)
+            stop_messages = server.get_messages("stop")
+            self.assertTrue(stop_messages)
+            for message in stop_messages:
+                self.assertEqual(stop_result.generation, message.data["generation"])
+
+            # quit allocates the highest generation and carries it on the wire
+            server.outbox.clear()
+            master.quit()
+            sleep(0)
+            quit_messages = server.get_messages("quit")
+            self.assertTrue(quit_messages)
+            for message in quit_messages:
+                self.assertEqual(stop_result.generation + 1, message.data["generation"])
+
+    def test_concurrent_stops_share_result_and_fire_lifecycle_once(self):
+        """TR-5.3: concurrent/re-entrant stop() calls send one stop generation, fire
+        test_stopping/test_stop once, and all return the same result object."""
+
+        class TestUser(User):
+            @task
+            def my_task(self):
+                pass
+
+        with (
+            mock.patch("locust.rpc.rpc.Server", mocked_rpc()) as server,
+            patch_env("LOCUST_WAIT_FOR_WORKERS_REPORT_AFTER_RAMP_UP", "2"),
+        ):
+            master = self._master_with_fake_workers(server, TestUser, 2)
+
+            counts = {"stopping": 0, "stop": 0}
+
+            @self.environment.events.test_stopping.add_listener
+            def on_test_stopping(*_, **__):
+                counts["stopping"] += 1
+
+            @self.environment.events.test_stop.add_listener
+            def on_test_stop(*_, **__):
+                counts["stop"] += 1
+
+            start_greenlet = gevent.spawn(master.start, 2, 2)
+            sleep(0.2)
+            self.assertEqual(STATE_SPAWNING, master.state)
+
+            # Pretend users are still running so the first stop parks in its wait loop,
+            # letting the concurrent calls observe STATE_STOPPING and join the result.
+            with mock.patch.object(
+                type(master), "user_count", new_callable=mock.PropertyMock, return_value=5
+            ):
+                stop_greenlets = [gevent.spawn(master.stop) for _ in range(3)]
+                sleep(0.3)
+                # exactly one stop generation was dispatched, one message per worker
+                stop_messages = [m for m in server.outbox if m.type == "stop"]
+                self.assertEqual(2, len(stop_messages))
+                self.assertEqual(1, len({m.data["generation"] for m in stop_messages}))
+                self.assertEqual(STATE_STOPPING, master.state)
+                self.assertEqual(1, counts["stopping"])
+            # once the reported user count drops to zero the joined calls all converge
+            gevent.joinall(stop_greenlets, timeout=10)
+            self.assertTrue(all(g.ready() and g.value is not None for g in stop_greenlets))
+            shared_result = stop_greenlets[0].value
+            for g in stop_greenlets:
+                self.assertIs(shared_result, g.value)
+            self.assertTrue(shared_result.confirmed)
+            self.assertEqual({"stopping": 1, "stop": 1}, counts)
+
+            # once all workers report ready the master transitions to STOPPED and a
+            # further stop is a no-op
+            master.check_stopped()
+            self.assertEqual(STATE_STOPPED, master.state)
+            self.assertIsNone(master.stop())
+            self.assertEqual({"stopping": 1, "stop": 1}, counts)
+
+            start_greenlet.join(timeout=5)
+
+    def test_local_runner_concurrent_starts_and_stops_fire_lifecycle_once_per_generation(self):
+        """TR-5.4: LocalRunner concurrent starts converge to the last target with the
+        lifecycle firing at most once per running generation, even across stop/start."""
+
+        class TestUser(User):
+            wait_time = constant(0)
+
+            @task
+            def my_task(self):
+                pass
+
+        environment = Environment(user_classes=[TestUser])
+        runner = environment.create_local_runner()
+
+        counts = {"start": 0, "stopping": 0, "stop": 0}
+
+        @environment.events.test_start.add_listener
+        def on_test_start(*_, **__):
+            counts["start"] += 1
+
+        @environment.events.test_stopping.add_listener
+        def on_test_stopping(*_, **__):
+            counts["stopping"] += 1
+
+        @environment.events.test_stop.add_listener
+        def on_test_stop(*_, **__):
+            counts["stop"] += 1
+
+        greenlets = [gevent.spawn(runner.start, target, spawn_rate=1000) for target in (10, 20, 30)]
+        gevent.joinall(greenlets, timeout=5)
+
+        @retry(AssertionError, tries=20, delay=0.1)
+        def assert_final_target():
+            self.assertEqual(30, runner.user_count)
+
+        assert_final_target()
+        self.assertEqual(1, counts["start"])
+
+        runner.stop()
+        self.assertEqual(0, runner.user_count)
+        self.assertEqual(1, counts["stopping"])
+        self.assertEqual(1, counts["stop"])
+
+        # a re-entrant stop is a no-op
+        runner.stop()
+        self.assertEqual(1, counts["stopping"])
+        self.assertEqual(1, counts["stop"])
+
+        # second running generation
+        runner.start(10, spawn_rate=1000)
+
+        @retry(AssertionError, tries=20, delay=0.1)
+        def assert_second_target():
+            self.assertEqual(10, runner.user_count)
+
+        assert_second_target()
+        runner.stop()
+        self.assertEqual({"start": 2, "stopping": 2, "stop": 2}, counts)
 
 
 class TestWorkerRunner(LocustTestCase):
@@ -3580,7 +4158,21 @@ class TestWorkerRunner(LocustTestCase):
             # check that locust user did not get to finish
             self.assertEqual(1, MyTestUser._test_state)
 
-    def test_spawn_message_with_older_timestamp_is_rejected(self):
+    def spawn_message(self, generation, counts):
+        return Message(
+            "spawn",
+            {
+                "timestamp": 1605538584 + generation,
+                "generation": generation,
+                "user_classes_count": counts,
+                "host": "",
+                "stop_timeout": None,
+                "parsed_options": {},
+            },
+            "dummy_client_id",
+        )
+
+    def test_spawn_message_with_older_generation_is_rejected(self):
         class MyUser(User):
             wait_time = constant(1)
 
@@ -3597,78 +4189,189 @@ class TestWorkerRunner(LocustTestCase):
         with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
             worker = self.get_runner(environment=Environment(), user_classes=[MyUser], client=client)
 
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538584,
-                        "user_classes_count": {"MyUser": 10},
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
+            client.mocked_send(self.spawn_message(1, {"MyUser": 10}))
             sleep(0.6)
             self.assertEqual(STATE_SPAWNING, worker.state)
             worker.spawning_greenlet.join()
             self.assertEqual(10, worker.user_count)
 
-            # Send same timestamp as the first message
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538584,
-                        "user_classes_count": {"MyUser": 9},
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
-            worker.spawning_greenlet.join()
+            # Send same generation with the same target: no-op but re-acknowledged
+            client.outbox.clear()
+            client.mocked_send(self.spawn_message(1, {"MyUser": 10}))
+            sleep(0)
+            # Still 10 users, no new spawning dispatch, but an ack was produced
+            self.assertEqual(10, worker.user_count)
+            self.assertTrue(client.get_messages("command_ack"))
+            self.assertFalse(client.get_messages("spawning"))
+
+            # Send older generation: must be discarded and reported as stale
+            client.outbox.clear()
+            client.mocked_send(self.spawn_message(0, {"MyUser": 2}))
+            sleep(0)
             # Still 10 users
             self.assertEqual(10, worker.user_count)
+            self.assertTrue(client.get_messages("command_stale"))
+            self.assertFalse(client.get_messages("spawning"))
 
-            # Send older timestamp than the first message
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538583,
-                        "user_classes_count": {"MyUser": 2},
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
-            worker.spawning_greenlet.join()
-            # Still 10 users
-            self.assertEqual(10, worker.user_count)
-
-            # Send newer timestamp than the first message
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538585,
-                        "user_classes_count": {"MyUser": 2},
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
+            # Send newer generation: applies
+            client.mocked_send(self.spawn_message(2, {"MyUser": 2}))
             worker.spawning_greenlet.join()
             self.assertEqual(2, worker.user_count)
 
             worker.quit()
+
+    def test_same_generation_rebalance_applies_without_lifecycle_refire(self):
+        class MyUser(User):
+            wait_time = constant(1)
+
+            @task
+            def my_task(self):
+                pass
+
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            environment = Environment()
+            test_start_count = [0]
+
+            @environment.events.test_start.add_listener
+            def on_test_start(**kw):
+                test_start_count[0] += 1
+
+            worker = self.get_runner(environment=environment, user_classes=[MyUser], client=client)
+
+            client.mocked_send(self.spawn_message(0, {"MyUser": 5}))
+            worker.spawning_greenlet.join()
+            self.assertEqual(5, worker.user_count)
+            self.assertEqual(1, test_start_count[0])
+
+            # Same generation, changed target: apply the delta, no lifecycle refire
+            client.mocked_send(self.spawn_message(0, {"MyUser": 2}))
+            worker.spawning_greenlet.join()
+            self.assertEqual(2, worker.user_count)
+            self.assertEqual(1, test_start_count[0])
+
+            # Same generation, same target: no-op with re-ack
+            client.outbox.clear()
+            client.mocked_send(self.spawn_message(0, {"MyUser": 2}))
+            sleep(0)
+            self.assertEqual(2, worker.user_count)
+            self.assertEqual(1, test_start_count[0])
+            self.assertTrue(client.get_messages("command_ack"))
+
+            worker.quit()
+
+    def test_stale_commands_have_no_side_effects(self):
+        class MyUser(User):
+            wait_time = constant(1)
+
+            @task
+            def my_task(self):
+                pass
+
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            environment = Environment()
+            test_stop_count = [0]
+
+            @environment.events.test_stop.add_listener
+            def on_test_stop(**kw):
+                test_stop_count[0] += 1
+
+            worker = self.get_runner(environment=environment, user_classes=[MyUser], client=client)
+
+            # Establish running at generation 2
+            client.mocked_send(self.spawn_message(2, {"MyUser": 1}))
+            worker.spawning_greenlet.join()
+            self.assertEqual(1, worker.user_count)
+
+            # Stale stop: no side effects, worker keeps its users, stale reported
+            client.outbox.clear()
+            client.mocked_send(Message("stop", {"generation": 1}, "dummy_client_id"))
+            sleep(0)
+            self.assertEqual(1, worker.user_count)
+            self.assertEqual(0, test_stop_count[0])
+            self.assertTrue(client.get_messages("command_stale"))
+            self.assertFalse(client.get_messages("command_ack"))
+            self.assertFalse(client.get_messages("client_stopped"))
+            self.assertEqual(STATE_RUNNING, worker.worker_state)
+
+            # Stale spawn: likewise discarded
+            client.outbox.clear()
+            client.mocked_send(self.spawn_message(1, {"MyUser": 50}))
+            sleep(0)
+            self.assertEqual(1, worker.user_count)
+            self.assertTrue(client.get_messages("command_stale"))
+
+            # Current generation stop: applies and stops exactly once
+            client.mocked_send(Message("stop", {"generation": 3}, "dummy_client_id"))
+            sleep(0.05)
+            self.assertEqual(0, worker.user_count)
+            self.assertEqual(1, test_stop_count[0])
+
+            # Stale quit cannot kill a live worker (it is discarded); current quit works
+            client.mocked_send(
+                Message(
+                    "spawn",
+                    {
+                        "generation": 4,
+                        "user_classes_count": {"MyUser": 1},
+                        "host": "",
+                        "stop_timeout": None,
+                        "parsed_options": {},
+                    },
+                    "dummy_client_id",
+                )
+            )
+            worker.spawning_greenlet.join()
+            self.assertEqual(1, worker.user_count)
+            client.outbox.clear()
+            client.mocked_send(Message("quit", {"generation": 2}, "dummy_client_id"))
+            sleep(0)
+            self.assertTrue(client.get_messages("command_stale"))
+            self.assertEqual(1, worker.user_count)
+            # The stale quit did not kill the worker; a newer command is still processed
+            client.outbox.clear()
+            client.mocked_send(self.spawn_message(5, {"MyUser": 2}))
+            worker.spawning_greenlet.join()
+            self.assertEqual(2, worker.user_count)
+
+            worker.quit()
+
+    def test_duplicate_stop_is_idempotent(self):
+        class MyUser(User):
+            wait_time = constant(1)
+
+            @task
+            def my_task(self):
+                pass
+
+        with mock.patch("locust.rpc.rpc.Client", mocked_rpc()) as client:
+            environment = Environment()
+            counts = {"stopping": 0, "stop": 0}
+
+            @environment.events.test_stopping.add_listener
+            def on_test_stopping(**kw):
+                counts["stopping"] += 1
+
+            @environment.events.test_stop.add_listener
+            def on_test_stop(**kw):
+                counts["stop"] += 1
+
+            worker = self.get_runner(environment=environment, user_classes=[MyUser], client=client)
+            client.mocked_send(self.spawn_message(0, {"MyUser": 1}))
+            worker.spawning_greenlet.join()
+
+            client.mocked_send(Message("stop", {"generation": 1}, "dummy_client_id"))
+            sleep(0.05)
+            self.assertEqual(1, counts["stopping"])
+            self.assertEqual(1, counts["stop"])
+
+            # Duplicate stop at the same generation: ack again, no lifecycle refire
+            client.outbox.clear()
+            client.mocked_send(Message("stop", {"generation": 1}, "dummy_client_id"))
+            sleep(0.05)
+            self.assertEqual(1, counts["stopping"])
+            self.assertEqual(1, counts["stop"])
+            self.assertTrue(client.get_messages("command_ack"))
+            self.assertFalse(client.get_messages("client_stopped"))
 
     def test_worker_messages_sent_to_master(self):
         """
@@ -3749,10 +4452,11 @@ class TestWorkerRunner(LocustTestCase):
                 sleep(0.1)
 
             message = client.get_messages("heartbeat")[-1]
-            self.assertEqual(len(message.data), 3)
+            self.assertEqual(len(message.data), 4)
             self.assertIn("state", message.data)
             self.assertIn("current_cpu_usage", message.data)
             self.assertIn("current_memory_usage", message.data)
+            self.assertIn("generation", message.data)
 
             worker.quit()
 
@@ -3997,21 +4701,7 @@ class TestWorkerRunner(LocustTestCase):
             messages = client.get_messages()
             self.assertEqual(1, len(messages))
             self.assertEqual("client_ready", messages[0].type)
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538585,
-                        "user_classes_count": {"MyTestUser": 1},
-                        "spawn_rate": 1,
-                        "num_users": 1,
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
+            client.mocked_send(self.spawn_message(0, {"MyTestUser": 1}))
             # wait for worker to spawn locusts
             self.assertTrue(client.get_messages("spawning"))
             worker.spawning_greenlet.join()
@@ -4023,44 +4713,16 @@ class TestWorkerRunner(LocustTestCase):
             self.assertEqual(1, MyTestUser._test_state)
 
             # change number of users and check that test_start isn't fired again
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538586,
-                        "user_classes_count": {"MyTestUser": 1},
-                        "spawn_rate": 1,
-                        "num_users": 1,
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
+            client.mocked_send(self.spawn_message(0, {"MyTestUser": 1}))
             self.assertEqual(1, run_count[0])
 
             # stop and start to make sure test_start is fired again
-            client.mocked_send(Message("stop", None, "dummy_client_id"))
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538587,
-                        "user_classes_count": {"MyTestUser": 1},
-                        "spawn_rate": 1,
-                        "num_users": 1,
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
+            client.mocked_send(Message("stop", {"generation": 1}, "dummy_client_id"))
+            client.mocked_send(self.spawn_message(2, {"MyTestUser": 1}))
             gevent.sleep(0.01)
             self.assertEqual(2, run_count[0])
 
-            client.mocked_send(Message("stop", None, "dummy_client_id"))
+            client.mocked_send(Message("stop", {"generation": 3}, "dummy_client_id"))
 
     def test_stop_event(self):
         class MyTestUser(User):
@@ -4084,21 +4746,7 @@ class TestWorkerRunner(LocustTestCase):
             messages = client.get_messages()
             self.assertEqual(1, len(messages))
             self.assertEqual("client_ready", messages[0].type)
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538585,
-                        "user_classes_count": {"MyTestUser": 1},
-                        "spawn_rate": 1,
-                        "num_users": 1,
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
+            client.mocked_send(self.spawn_message(0, {"MyTestUser": 1}))
 
             # wait for worker to spawn locusts
             self.assertTrue(client.get_messages("spawning"))
@@ -4110,32 +4758,19 @@ class TestWorkerRunner(LocustTestCase):
             self.assertEqual(1, MyTestUser._test_state)
 
             # stop and make sure test_stop is fired
-            client.mocked_send(Message("stop", None, "dummy_client_id"))
+            client.mocked_send(Message("stop", {"generation": 1}, "dummy_client_id"))
             gevent.sleep(0.01)
             self.assertEqual(1, run_count[0])
 
-            # stop while stopped and make sure the event isn't fired again
-            client.mocked_send(Message("stop", None, "dummy_client_id"))
+            # stop with the same generation and make sure the event isn't fired again
+            client.mocked_send(Message("stop", {"generation": 1}, "dummy_client_id"))
             gevent.sleep(0.01)
             self.assertEqual(1, run_count[0])
 
             # start and stop to check that the event is fired again
-            client.mocked_send(
-                Message(
-                    "spawn",
-                    {
-                        "timestamp": 1605538586,
-                        "user_classes_count": {"MyTestUser": 1},
-                        "spawn_rate": 1,
-                        "num_users": 1,
-                        "host": "",
-                        "stop_timeout": None,
-                        "parsed_options": {},
-                    },
-                    "dummy_client_id",
-                )
-            )
-            client.mocked_send(Message("stop", None, "dummy_client_id"))
+            client.mocked_send(self.spawn_message(2, {"MyTestUser": 1}))
+            worker.spawning_greenlet.join()
+            client.mocked_send(Message("stop", {"generation": 3}, "dummy_client_id"))
             gevent.sleep(0.01)
             self.assertEqual(2, run_count[0])
 
@@ -4237,7 +4872,7 @@ class TestWorkerRunner(LocustTestCase):
 
 class TestMessageSerializing(unittest.TestCase):
     def test_message_serialize(self):
-        msg = Message("client_ready", __version__, "my_id")
+        msg = Message("client_ready", {"version": __version__, "generation": -1, "state": "ready"}, "my_id")
         rebuilt = Message.unserialize(msg.serialize())
         self.assertEqual(msg.type, rebuilt.type)
         self.assertEqual(msg.data, rebuilt.data)
@@ -4533,3 +5168,109 @@ class TestStopTimeout(LocustTestCase):
         self.assertTrue(
             runner.user_count == 2, "User count has not decreased correctly to 2, it is : %i" % runner.user_count
         )
+
+
+class TestClusterCommandPrimitives(unittest.TestCase):
+    def test_result_confirms_when_all_expected_workers_ack(self):
+        result = runners.ClusterCommandResult(1, runners.INTENT_SPAWN, expected_workers=["w1", "w2"])
+        self.assertEqual(runners.COMMAND_PENDING, result.status)
+        result.ack("w1")
+        self.assertFalse(result.confirmed)
+        self.assertEqual({"w2"}, result.missing_workers)
+        result.ack("w2", payload={"user_count": 3})
+        self.assertTrue(result.confirmed)
+        self.assertEqual(set(), result.missing_workers)
+        self.assertEqual({"user_count": 3}, result.ack_payloads["w2"])
+        # late acks do not change a terminal result
+        self.assertFalse(result.ack("w3"))
+        self.assertTrue(result.confirmed)
+
+    def test_result_wait_blocks_until_completion(self):
+        result = runners.ClusterCommandResult(1, runners.INTENT_SPAWN, expected_workers=["w1"])
+        gevent.spawn_later(0.01, lambda: result.ack("w1"))
+        returned = result.wait(timeout=2)
+        self.assertIs(result, returned)
+        self.assertTrue(result.confirmed)
+
+    def test_result_timeout_records_missing_snapshot(self):
+        result = runners.ClusterCommandResult(1, runners.INTENT_SPAWN, expected_workers=["w1", "w2"])
+        result.ack("w1")
+        self.assertTrue(result.finish(runners.COMMAND_TIMEOUT))
+        self.assertEqual(runners.COMMAND_TIMEOUT, result.status)
+        self.assertEqual({"w2"}, result.missing_workers)
+        # terminal transition happens only once
+        self.assertFalse(result.finish(runners.COMMAND_CONFIRMED))
+        self.assertEqual(runners.COMMAND_TIMEOUT, result.status)
+
+    def test_result_dropping_last_missing_worker_completes(self):
+        result = runners.ClusterCommandResult(1, runners.INTENT_SPAWN, expected_workers=["w1", "w2"])
+        result.ack("w1")
+        result.drop_expected("w2")
+        self.assertTrue(result.confirmed)
+
+    def test_result_empty_expected_set_does_not_auto_confirm(self):
+        result = runners.ClusterCommandResult(1, runners.INTENT_SPAWN)
+        result.ack("w1")
+        self.assertFalse(result.confirmed)
+        self.assertEqual(runners.COMMAND_PENDING, result.status)
+
+    def test_ledger_increments_only_on_intent_change_and_coalesces_pending(self):
+        ledger = runners.ClusterCommandLedger()
+        r1 = ledger.submit(runners.INTENT_SPAWN, target=("t1",), expected_workers=["w1"])
+        self.assertEqual(1, r1.generation)
+        # same intent+target while pending -> same generation, same result, workers unioned
+        r1_again = ledger.submit(runners.INTENT_SPAWN, target=("t1",), expected_workers=["w2"])
+        self.assertIs(r1, r1_again)
+        self.assertEqual({"w1", "w2"}, r1.expected_workers)
+        # different target -> new generation, old result superseded
+        r2 = ledger.submit(runners.INTENT_SPAWN, target=("t2",), expected_workers=["w1"])
+        self.assertEqual(2, r2.generation)
+        self.assertEqual(runners.COMMAND_SUPERSEDED, r1.status)
+        self.assertEqual({"w1", "w2"}, r1.missing_workers)
+        self.assertEqual(r2, ledger.current)
+        # stop is a different intent -> generation 3
+        r3 = ledger.submit(runners.INTENT_STOP, expected_workers=["w1"])
+        self.assertEqual(3, r3.generation)
+        self.assertEqual(runners.COMMAND_SUPERSEDED, r2.status)
+
+    def test_ledger_reuses_generation_when_same_intent_resubmitted_after_terminal(self):
+        ledger = runners.ClusterCommandLedger()
+        r1 = ledger.submit(runners.INTENT_SPAWN, target=("t1",), expected_workers=["w1"])
+        r1.ack("w1")
+        self.assertTrue(r1.confirmed)
+        # rebalance / reconnect re-dispatch of the very same cluster intent
+        r2 = ledger.submit(runners.INTENT_SPAWN, target=("t1",), expected_workers=["w1"])
+        self.assertIsNot(r1, r2)
+        self.assertEqual(1, r2.generation)
+        self.assertEqual(runners.COMMAND_PENDING, r2.status)
+
+    def test_ledger_observe_ack_routes_only_to_current_generation(self):
+        ledger = runners.ClusterCommandLedger()
+        r1 = ledger.submit(runners.INTENT_SPAWN, target=("t1",), expected_workers=["w1"])
+        self.assertIsNone(ledger.observe_ack("w1", 99))
+        self.assertEqual(set(), r1.acked_workers)
+        self.assertIs(r1, ledger.observe_ack("w1", 1))
+        self.assertTrue(r1.confirmed)
+        # acks for a terminal generation are ignored
+        self.assertIsNone(ledger.observe_ack("w1", 1))
+
+    def test_ledger_drop_worker_removes_from_pending_result(self):
+        ledger = runners.ClusterCommandLedger()
+        r1 = ledger.submit(runners.INTENT_SPAWN, target=("t1",), expected_workers=["w1", "w2"])
+        ledger.observe_ack("w1", 1)
+        ledger.drop_worker("w2")
+        self.assertTrue(r1.confirmed)
+
+    def test_generation_payloads_survive_message_round_trip(self):
+        for msg_type, data in [
+            ("spawn", {"timestamp": 1.0, "generation": 7, "user_classes_count": {"A": 3}}),
+            ("stop", {"generation": 8}),
+            ("quit", {"generation": 9}),
+            ("command_stale", {"generation": 6, "state": STATE_RUNNING}),
+            ("client_ready", runners.make_client_ready_data(__version__, 5, STATE_RUNNING)),
+        ]:
+            roundtrip = Message.unserialize(Message(msg_type, data, "w1").serialize())
+            self.assertEqual(msg_type, roundtrip.type)
+            self.assertEqual("w1", roundtrip.node_id)
+            self.assertEqual(data, roundtrip.data)
+
